@@ -21,13 +21,14 @@ public class BridgeConfig {
     public int    worldSizeLimit      = 0;
     public String negativeYHandling   = "clamp";
     public int    viewDistance        = 0;
-    public int    chunksPerTick       = 10;
+    public int    chunksPerTick       = 4;
 
     // Performance
     public int     chunkTranslationThreads = 0;
     public boolean chunkCacheEnabled       = true;
     public int     chunkCacheSize          = 256;
     public boolean asyncCompression        = true;
+    public boolean liveTileUpdates         = false;
 
     // Logging
     public String  logLevel              = "info";

@@ -41,6 +41,7 @@ public class ConfigLoader {
             cfg.chunkCacheEnabled       = bool(performance, "chunk-cache-enabled", cfg.chunkCacheEnabled);
             cfg.chunkCacheSize          = integer(performance, "chunk-cache-size", cfg.chunkCacheSize);
             cfg.asyncCompression        = bool(performance, "async-compression", cfg.asyncCompression);
+            cfg.liveTileUpdates         = bool(performance, "live-tile-updates", cfg.liveTileUpdates);
 
             Map<String, Object> logging = section(root, "logging");
             cfg.logLevel            = str(logging, "level", cfg.logLevel);

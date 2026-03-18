@@ -67,6 +67,7 @@ public class LceBridgeSession {
     private static final long BRIDGE_HOST_XUID    = 1L;
     private static final int LCE_SMALL_ID         = 4; // Remote clients start at XUSER_MAX_COUNT (4) in Win64 WinsockNetLayer
     private static final int LCE_ENTITY_ID        = (LCE_SMALL_ID * 100) + 1; // = 401
+    private static final long TILE_UPDATE_GRACE_MS = 2000L;
 
     private final BridgeConfig  config;
     private final Channel       lceChannel;
@@ -75,6 +76,7 @@ public class LceBridgeSession {
     private final AtomicBoolean spawnFinished  = new AtomicBoolean(false);
     private final AtomicBoolean initialTeleportHandled = new AtomicBoolean(false);
     private final AtomicBoolean postChunkSpawnSent = new AtomicBoolean(false);
+    private final AtomicBoolean postChunkReady = new AtomicBoolean(false);
     private final AtomicBoolean clientInformationSent = new AtomicBoolean(false);
     private final AtomicBoolean javaChunkBatchFinished = new AtomicBoolean(false);
     private final AtomicBoolean firstChunkLogged = new AtomicBoolean(false);
@@ -92,8 +94,11 @@ public class LceBridgeSession {
     private volatile long chunkLoadStartMs = 0L;
     private volatile long lastChunkNudgeMs = 0L;
     private volatile long lastDelimiterMs = 0L;
+    private volatile long lastMovePacketMs = 0L;
+    private volatile long tileUpdatesReadyAtMs = Long.MAX_VALUE;
     private final AtomicBoolean delimiterSeen = new AtomicBoolean(false);
     private final AtomicBoolean playerMoving  = new AtomicBoolean(false);
+    private volatile boolean lastOnGround = true;
     private volatile int blockActionSequence  = 0;
     private volatile Integer activeDigSequence = null;
     private volatile org.cloudburstmc.math.vector.Vector3i activeDigPos = null;
@@ -212,10 +217,28 @@ public class LceBridgeSession {
 
     private void handleMove(MovePlayerPacket p) {
         if (!javaSession.isConnected()) return;
+        // Ignore placeholder movement before Java has told us the real spawn position.
+        if (!initialTeleportHandled.get()) return;
+        boolean og = (p.flags & 0x1) != 0;
+        lastOnGround = og;
+        lastMovePacketMs = System.currentTimeMillis();
         boolean hasPosition = p.id == 11 || p.id == 13;
+        boolean readyForPosition = postChunkReady.get();
+        if (!readyForPosition && hasPosition) {
+            if (p.id == 13) {
+                javaSession.send(new ServerboundMovePlayerRotPacket(og, false, p.yaw, p.pitch));
+            } else {
+                javaSession.send(new ServerboundMovePlayerStatusOnlyPacket(og, false));
+            }
+            return;
+        }
+        boolean movedEnough = false;
         // Keep last-known pose current for heartbeat and relative teleports, even when
         // LCE sends position-only or rotation-only variants.
         if (hasPosition) {
+            movedEnough = Math.abs(p.x - lastKnownX) > 0.01d
+                || Math.abs(p.y - lastKnownY) > 0.01d
+                || Math.abs(p.z - lastKnownZ) > 0.01d;
             lastKnownX = p.x;
             lastKnownY = p.y;
             lastKnownZ = p.z;
@@ -231,11 +254,10 @@ public class LceBridgeSession {
         // The heartbeat sends a fixed position every 1s which vanilla's anti-fly detects
         // as the player hovering in mid-air, causing a "flying" kick after ~15 seconds.
         // Once the LCE client is sending its own movement at 20 pps we don't need it.
-        if (playerMoving.compareAndSet(false, true)) {
-            stopPositionHeartbeat();
+        if (hasPosition && movedEnough && playerMoving.compareAndSet(false, true)) {
             log.info("Player movement started — position heartbeat stopped");
+            log.info("Player movement started - heartbeat switched to idle mode");
         }
-        boolean og = (p.flags & 0x1) != 0;
         switch (p.id) {
             case 10 -> javaSession.send(new ServerboundMovePlayerStatusOnlyPacket(og, false));
             case 11 -> javaSession.send(new ServerboundMovePlayerPosPacket(og, false, p.x, p.y, p.z));
@@ -293,10 +315,11 @@ public class LceBridgeSession {
             Math.max(0, Math.min(p.face, org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction.values().length - 1))];
         var pos = rawPos;
         var dir = rawDir;
+        boolean blankDigPos = rawPos.getX() == 0 && rawPos.getY() == 0 && rawPos.getZ() == 0;
 
         // LCE occasionally follows a valid START_DESTROY_BLOCK with ABORT/STOP at 0,0,0.
         // Vanilla Java treats that as a mismatched dig target and rejects the break.
-        if ((p.action == 1 || p.action == 2) && activeDigPos != null && rawPos.getX() == 0 && rawPos.getY() == 0 && rawPos.getZ() == 0) {
+        if ((p.action == 1 || p.action == 2) && activeDigPos != null && blankDigPos) {
             pos = activeDigPos;
             dir = activeDigFace;
             log.info("Substituting active dig target for blank LCE action {} -> ({}, {}, {})",
@@ -315,7 +338,9 @@ public class LceBridgeSession {
             } else {
                 seq = ++blockActionSequence;
             }
-            if (p.action == 1 || p.action == 2) {
+            // Keep the active dig target alive across blank ABORT packets; some LCE
+            // clients follow with a second blank FINISH packet for the same block.
+            if (p.action == 2 || !blankDigPos) {
                 activeDigSequence = null;
                 activeDigPos = null;
                 activeDigFace = org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction.DOWN;
@@ -620,14 +645,14 @@ public class LceBridgeSession {
     }
 
     private void onJavaBlockUpdate(ClientboundBlockUpdatePacket p) {
-        if (!spawnFinished.get()) return;
+        if (!canSendTileUpdates()) return;
         var entry = p.getEntry();
         if (entry == null || entry.getPosition() == null) return;
         sendTileUpdate(entry.getPosition().getX(), entry.getPosition().getY(), entry.getPosition().getZ(), entry.getBlock());
     }
 
     private void onJavaSectionBlocksUpdate(ClientboundSectionBlocksUpdatePacket p) {
-        if (!spawnFinished.get() || p.getEntries() == null) return;
+        if (!canSendTileUpdates() || p.getEntries() == null) return;
         for (var entry : p.getEntries()) {
             if (entry == null || entry.getPosition() == null) continue;
             // MCProtocolLib already expands section-local coordinates to global block positions.
@@ -782,7 +807,9 @@ public class LceBridgeSession {
             sh.health = 20.0f; sh.food = 20; sh.saturation = 5.0f;
             sendLce(sh);
 
-            // LCE client is now spawned — allow chat and other post-spawn packets.
+            // Keep the original session state semantics: after the first confirmed
+            // teleport, the client is considered in-world for the rest of the spawn
+            // pipeline and the chunk startup watchdogs.
             spawnFinished.set(true);
             log.info("Sent initial LCE teleport at actual spawn ({},{},{})", lastKnownX, lastKnownY, lastKnownZ);
             startPositionHeartbeat();
@@ -801,10 +828,15 @@ public class LceBridgeSession {
         // naturally follow with health + teleport updates.
         updateLevelIdx(p.getCommonPlayerSpawnInfo());
         containerStateIds.clear();
+        spawnFinished.set(false);
+        postChunkReady.set(false);
+        tileUpdatesReadyAtMs = Long.MAX_VALUE;
         initialTeleportHandled.set(false);
         postChunkSpawnSent.set(false);
         teleportAcked.set(false);
         playerMoving.set(false);
+        lastMovePacketMs = 0L;
+        lastOnGround = true;
         stopPositionHeartbeat();
         activeDigSequence = null;
         activeDigPos = null;
@@ -924,7 +956,12 @@ public class LceBridgeSession {
 
     private void onJavaDisconnected() {
         stopClientTickLoop();
+        spawnFinished.set(false);
+        postChunkReady.set(false);
+        tileUpdatesReadyAtMs = Long.MAX_VALUE;
         playerMoving.set(false);
+        lastMovePacketMs = 0L;
+        lastOnGround = true;
         initialTeleportHandled.set(false);
         postChunkSpawnSent.set(false);
         teleportAcked.set(false);
@@ -1117,15 +1154,10 @@ public class LceBridgeSession {
     }
 
     /**
-     * Sends a lightweight status heartbeat while the LCE client is still loading.
-     * Automatically stops once the client starts sending its own movement packets.
+     * Sends an idle status heartbeat whenever the LCE client has gone quiet.
+     * Java still expects periodic onGround updates even while the player stands still.
      */
     private void startPositionHeartbeat() {
-        // Heartbeat is only needed while waiting for first real client movement.
-        // If movement has started, never restart it.
-        if (playerMoving.get()) {
-            return;
-        }
         // Stop any existing heartbeat so we restart with the new position.
         if (posHeartbeatScheduler != null && !posHeartbeatScheduler.isShutdown()) {
             posHeartbeatScheduler.shutdownNow();
@@ -1142,13 +1174,12 @@ public class LceBridgeSession {
                     log.warn("Heartbeat: Java session not connected, skipping tick");
                     return;
                 }
-                // As soon as the player starts sending movement packets, heartbeat should end.
-                if (playerMoving.get()) {
-                    stopPositionHeartbeat();
+                long idleMs = System.currentTimeMillis() - lastMovePacketMs;
+                if (lastMovePacketMs != 0L && idleMs < 750L) {
                     return;
                 }
-                javaSession.send(new ServerboundMovePlayerStatusOnlyPacket(true, false));
-                log.debug("Heartbeat status sent at abs ({},{},{})", lastKnownX, lastKnownY, lastKnownZ);
+                javaSession.send(new ServerboundMovePlayerStatusOnlyPacket(lastOnGround, false));
+                log.debug("Idle heartbeat sent at abs ({},{},{}) onGround={}", lastKnownX, lastKnownY, lastKnownZ, lastOnGround);
             } catch (Exception e) {
                 log.error("Position heartbeat lambda threw — task will be silently cancelled without this catch!", e);
             }
@@ -1209,6 +1240,8 @@ public class LceBridgeSession {
         // Teleport and health were already sent in sendSpawnSequence() so LCE spawns
         // immediately without waiting for chunks. Here we just flush any pending
         // SetTime that arrived from Java while chunks were loading, and log completion.
+        postChunkReady.set(true);
+        tileUpdatesReadyAtMs = System.currentTimeMillis() + TILE_UPDATE_GRACE_MS;
         SetTimePacket time = pendingSetTime;
         if (time != null) {
             sendLce(time);
@@ -1225,6 +1258,12 @@ public class LceBridgeSession {
         log.info("Post-chunk spawn complete for '{}'", playerName);
     }
 
+    private boolean canSendTileUpdates() {
+        return config.liveTileUpdates
+            && postChunkReady.get()
+            && System.currentTimeMillis() >= tileUpdatesReadyAtMs;
+    }
+
     // MovePlayerPosRot (id=13) for teleport
     private LcePacket buildTeleport(double x, double y, double z, float yaw, float pitch) {
         return new RawLcePacket(13, buf -> {
@@ -1232,10 +1271,11 @@ public class LceBridgeSession {
             w.writeByte(13);
             // Win64 LCE MovePlayerPosRot format:
             // [double x][double y][double yView][double z][float yRot][float xRot][byte flags]
+            // Retail server teleports populate y=eyeY and yView=feetY.
             // flags: bit0=onGround, bit1=isFlying
             w.writeDouble(x);
+            w.writeDouble(y + 1.62d);
             w.writeDouble(y);
-            w.writeDouble(y + 1.62d); // eye height for yView
             w.writeDouble(z);
             w.writeFloat(yaw);
             w.writeFloat(pitch);
