@@ -1,14 +1,24 @@
-# Build output — everything lands in here
+# Build output
 _build/
+out/
+bin/
 
-# Gradle project cache (auto-generated, not source)
+# Gradle cache
 .gradle/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.iml
 
 # Runtime output
 dumps/
+logs/
 *.log
+hs_err_pid*
+replay_pid*
 
-# Gradle wrapper JAR is committed, everything else is generated
+# Keep committed Gradle wrapper files
 !gradle/wrapper/gradle-wrapper.jar
 !gradle/wrapper/gradle-wrapper.properties
 !gradlew.bat
