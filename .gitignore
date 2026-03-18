@@ -3,6 +3,9 @@ _build/
 out/
 bin/
 
+# Internal Scripts
+Scripts/
+
 # Gradle cache
 .gradle/
 
@@ -14,6 +17,7 @@ bin/
 # Runtime output
 dumps/
 logs/
+scripts/output/
 *.log
 hs_err_pid*
 replay_pid*
