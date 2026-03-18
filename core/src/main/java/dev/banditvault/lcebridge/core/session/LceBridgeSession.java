@@ -101,7 +101,6 @@ public class LceBridgeSession {
     private final AtomicBoolean playerMoving  = new AtomicBoolean(false);
     private volatile boolean lastOnGround = true;
     private volatile int blockActionSequence  = 0;
-    private volatile Integer activeDigSequence = null;
     private volatile org.cloudburstmc.math.vector.Vector3i activeDigPos = null;
     private volatile org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction activeDigFace = DEFAULT_DIG_FACE;
     private volatile byte lastJavaAbilityFlags = 0;
@@ -275,6 +274,7 @@ public class LceBridgeSession {
     private void handleUseItem(UseItemPacket p) {
         if (!javaSession.isConnected()) return;
 
+        flushLatestPoseForAction();
         int sequence = ++blockActionSequence;
         if (p.face == 255 || p.x == -1 || p.y == 255 || p.z == -1) {
             javaSession.send(new ServerboundUseItemPacket(Hand.MAIN_HAND, sequence, lastKnownYaw, lastKnownPitch));
@@ -291,6 +291,7 @@ public class LceBridgeSession {
     private void handleInteract(InteractPacket p) {
         if (!javaSession.isConnected()) return;
 
+        flushLatestPoseForAction();
         if (p.action == 0) {
             javaSession.send(new ServerboundInteractPacket(p.target, InteractAction.INTERACT, Hand.MAIN_HAND, false));
         } else if (p.action == 1) {
@@ -300,6 +301,9 @@ public class LceBridgeSession {
 
     private void handlePlayerAction(PlayerActionPacket p) {
         if (!javaSession.isConnected()) return;
+        if (p.action == 0 || p.action == 1 || p.action == 2) {
+            flushLatestPoseForAction();
+        }
         var action = switch (p.action) {
             case 0 -> org.geysermc.mcprotocollib.protocol.data.game.entity.player.PlayerAction.START_DIGGING;
             case 1 -> org.geysermc.mcprotocollib.protocol.data.game.entity.player.PlayerAction.CANCEL_DIGGING;
@@ -314,44 +318,25 @@ public class LceBridgeSession {
         var rawDir = directionFromFaceIndex(p.face);
         var pos = rawPos;
         var dir = rawDir;
-        boolean blankDigPos = rawPos.getX() == 0 && rawPos.getY() == 0 && rawPos.getZ() == 0;
-
-        // ABORT should stay tied to the original target. LCE can also emit a blank
-        // STOP target; keep that tied to the active dig target too.
-        boolean shouldPinToActiveTarget =
-            activeDigPos != null && (p.action == 1 || (p.action == 2 && blankDigPos));
+        boolean shouldPinToActiveTarget = shouldPinDigTarget(p, rawPos);
         if (shouldPinToActiveTarget) {
             pos = activeDigPos;
             dir = currentDigFace();
-            if (!activeDigPos.equals(rawPos) || blankDigPos) {
+            if (!activeDigPos.equals(rawPos)) {
                 log.info("Pinning LCE dig action {} from ({}, {}, {}) to active target ({}, {}, {})",
                     p.action, rawPos.getX(), rawPos.getY(), rawPos.getZ(), pos.getX(), pos.getY(), pos.getZ());
             }
         }
 
-        int seq;
+        int seq = ++blockActionSequence;
         if (p.action == 0) {
-            seq = ++blockActionSequence;
-            activeDigSequence = seq;
             activeDigPos = pos;
             activeDigFace = dir;
-        } else if (p.action == 1 || p.action == 2) {
-            if (activeDigSequence != null && activeDigPos != null && activeDigPos.equals(pos)) {
-                seq = activeDigSequence;
-            } else {
-                seq = ++blockActionSequence;
-            }
-            // Keep the active dig target alive across ABORT packets; some LCE clients
-            // follow with a later FINISH for the same block.
-            if (p.action == 2) {
-                activeDigSequence = null;
-                activeDigPos = null;
-                activeDigFace = DEFAULT_DIG_FACE;
-            }
-        } else {
-            seq = ++blockActionSequence;
         }
         javaSession.send(new ServerboundPlayerActionPacket(action, pos, dir, seq));
+        if (p.action == 1 || p.action == 2) {
+            clearActiveDigState();
+        }
     }
 
     private void handlePlayerCommand(PlayerCommandPacket p) {
@@ -868,9 +853,7 @@ public class LceBridgeSession {
         lastMovePacketMs = 0L;
         lastOnGround = true;
         stopPositionHeartbeat();
-        activeDigSequence = null;
-        activeDigPos = null;
-        activeDigFace = DEFAULT_DIG_FACE;
+        clearActiveDigState();
         translatedChunkCache.clear();
         sendLce(buildRespawnPacket());
         SetHealthPacket sh = new SetHealthPacket();
@@ -1093,9 +1076,42 @@ public class LceBridgeSession {
         return face != null ? face : DEFAULT_DIG_FACE;
     }
 
+    private boolean shouldPinDigTarget(PlayerActionPacket p, org.cloudburstmc.math.vector.Vector3i rawPos) {
+        if (activeDigPos == null || (p.action != 1 && p.action != 2)) {
+            return false;
+        }
+        if (isSentinelDigTarget(rawPos, p.face)) {
+            return true;
+        }
+        return rawPos.getX() == activeDigPos.getX()
+            && rawPos.getZ() == activeDigPos.getZ()
+            && Math.abs(rawPos.getY() - activeDigPos.getY()) <= 1;
+    }
+
+    private boolean isSentinelDigTarget(org.cloudburstmc.math.vector.Vector3i pos, int faceIndex) {
+        return (pos.getX() == 0 && pos.getY() == 0 && pos.getZ() == 0)
+            || pos.getY() == 255
+            || faceIndex == 255;
+    }
+
     private org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction currentDigFace() {
         org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction face = activeDigFace;
         return face != null ? face : DEFAULT_DIG_FACE;
+    }
+
+    private void flushLatestPoseForAction() {
+        if (!initialTeleportHandled.get()) {
+            return;
+        }
+        javaSession.send(new ServerboundMovePlayerPosRotPacket(
+            lastOnGround, false, lastKnownX, lastKnownY, lastKnownZ, lastKnownYaw, lastKnownPitch
+        ));
+        lastMovePacketMs = System.currentTimeMillis();
+    }
+
+    private void clearActiveDigState() {
+        activeDigPos = null;
+        activeDigFace = DEFAULT_DIG_FACE;
     }
 
     private void onJavaDisconnected() {
@@ -1111,9 +1127,7 @@ public class LceBridgeSession {
         teleportAcked.set(false);
         containerStateIds.clear();
         blockActionSequence = 0;
-        activeDigSequence = null;
-        activeDigPos = null;
-        activeDigFace = DEFAULT_DIG_FACE;
+        clearActiveDigState();
         translatedChunkCache.clear();
         sendLce(makeDisconnect(2));
         lceChannel.close();
