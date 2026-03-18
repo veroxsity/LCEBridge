@@ -1,0 +1,14 @@
+# Build output — everything lands in here
+_build/
+
+# Gradle project cache (auto-generated, not source)
+.gradle/
+
+# Runtime output
+dumps/
+*.log
+
+# Gradle wrapper JAR is committed, everything else is generated
+!gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
+!gradlew.bat
