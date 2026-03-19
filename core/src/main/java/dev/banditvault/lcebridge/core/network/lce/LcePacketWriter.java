@@ -32,6 +32,13 @@ public class LcePacketWriter {
             case ChunkVisibilityAreaPacket p -> writeChunkVisibilityArea(p, w);
             case BlockRegionUpdatePacket p -> writeBlockRegionUpdate(p, w);
             case TileUpdatePacket p -> writeTileUpdate(p, w);
+            case AddPlayerPacket p -> writeAddPlayer(p, w);
+            case AddEntityPacket p -> writeAddEntity(p, w);
+            case AddMobPacket p -> writeAddMob(p, w);
+            case TeleportEntityPacket p -> writeTeleportEntity(p, w);
+            case RotateHeadPacket p -> writeRotateHead(p, w);
+            case RemoveEntitiesPacket p -> writeRemoveEntities(p, w);
+            case SetEntityDataPacket p -> writeSetEntityData(p, w);
             default -> throw new IllegalArgumentException("No encoder for LCE packet id=" + pkt.getId());
         }
     }
@@ -209,5 +216,111 @@ public class LcePacketWriter {
         w.writeInt(xyzData);
         w.writeShort(p.block);
         w.writeByte(p.levelIdx & 0xFF);
+    }
+
+    private static void writeAddPlayer(AddPlayerPacket p, LceByteWriter w) {
+        w.writeByte(AddPlayerPacket.ID);
+        w.writeInt(p.entityId);
+        w.writeUtf16(p.name);
+        w.writeInt(p.x);
+        w.writeInt(p.y);
+        w.writeInt(p.z);
+        w.writeByte(p.yaw);
+        w.writeByte(p.pitch);
+        w.writeByte(p.headYaw);
+        w.writeShort(p.carriedItem);
+        w.writeLong(p.offlineXuid);
+        w.writeLong(p.onlineXuid);
+        w.writeByte(p.playerIndex);
+        w.writeInt(p.skinId);
+        w.writeInt(p.capeId);
+        w.writeInt(p.gamePrivileges);
+        writeEntityMetadata(p.metadata, w);
+    }
+
+    private static void writeAddEntity(AddEntityPacket p, LceByteWriter w) {
+        w.writeByte(AddEntityPacket.ID);
+        w.writeShort(p.entityId);
+        w.writeByte(p.type);
+        w.writeInt(p.x);
+        w.writeInt(p.y);
+        w.writeInt(p.z);
+        w.writeByte(p.yaw);
+        w.writeByte(p.pitch);
+        w.writeInt(p.data);
+        if (p.data > -1) {
+            w.writeShort(p.motionX);
+            w.writeShort(p.motionY);
+            w.writeShort(p.motionZ);
+        }
+    }
+
+    private static void writeAddMob(AddMobPacket p, LceByteWriter w) {
+        w.writeByte(AddMobPacket.ID);
+        w.writeShort(p.entityId);
+        w.writeByte(p.type);
+        w.writeInt(p.x);
+        w.writeInt(p.y);
+        w.writeInt(p.z);
+        w.writeByte(p.yaw);
+        w.writeByte(p.pitch);
+        w.writeByte(p.headYaw);
+        w.writeShort(p.motionX);
+        w.writeShort(p.motionY);
+        w.writeShort(p.motionZ);
+        writeEntityMetadata(p.metadata, w);
+    }
+
+    private static void writeTeleportEntity(TeleportEntityPacket p, LceByteWriter w) {
+        w.writeByte(TeleportEntityPacket.ID);
+        w.writeShort(p.entityId);
+        w.writeInt(p.x);
+        w.writeInt(p.y);
+        w.writeInt(p.z);
+        w.writeByte(p.yaw);
+        w.writeByte(p.pitch);
+    }
+
+    private static void writeRotateHead(RotateHeadPacket p, LceByteWriter w) {
+        w.writeByte(RotateHeadPacket.ID);
+        w.writeInt(p.entityId);
+        w.writeByte(p.yHeadRot);
+    }
+
+    private static void writeRemoveEntities(RemoveEntitiesPacket p, LceByteWriter w) {
+        w.writeByte(RemoveEntitiesPacket.ID);
+        int count = Math.min(255, p.entityIds == null ? 0 : p.entityIds.size());
+        w.writeByte(count);
+        for (int i = 0; i < count; i++) {
+            w.writeInt(p.entityIds.get(i));
+        }
+    }
+
+    private static void writeSetEntityData(SetEntityDataPacket p, LceByteWriter w) {
+        w.writeByte(SetEntityDataPacket.ID);
+        w.writeInt(p.entityId);
+        writeEntityMetadata(p.values, w);
+    }
+
+    private static void writeEntityMetadata(java.util.List<SetEntityDataPacket.DataValue> values, LceByteWriter w) {
+        if (values != null) {
+            for (SetEntityDataPacket.DataValue value : values) {
+                if (value == null) {
+                    continue;
+                }
+                int header = ((value.type() << 5) | (value.id() & 0x1F)) & 0xFF;
+                w.writeByte(header);
+                switch (value.type()) {
+                    case SetEntityDataPacket.TYPE_BYTE -> w.writeByte(((Number) value.value()).intValue());
+                    case SetEntityDataPacket.TYPE_SHORT -> w.writeShort(((Number) value.value()).intValue());
+                    case SetEntityDataPacket.TYPE_INT -> w.writeInt(((Number) value.value()).intValue());
+                    case SetEntityDataPacket.TYPE_FLOAT -> w.writeFloat(((Number) value.value()).floatValue());
+                    case SetEntityDataPacket.TYPE_STRING -> w.writeUtf16((String) value.value());
+                    case SetEntityDataPacket.TYPE_ITEMINSTANCE -> LceItemCodec.writeItem((LceItemStack) value.value(), w);
+                    default -> throw new IllegalArgumentException("Unsupported LCE metadata type " + value.type());
+                }
+            }
+        }
+        w.writeByte(0x7F);
     }
 }

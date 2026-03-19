@@ -9,23 +9,28 @@ import dev.banditvault.lcebridge.core.registry.MappingRegistry;
 import io.netty.channel.Channel;
 import org.cloudburstmc.nbt.NbtMap;
 import org.cloudburstmc.nbt.NbtType;
+import org.cloudburstmc.math.vector.Vector3d;
 import org.geysermc.mcprotocollib.network.packet.Packet;
 import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundDisconnectPacket;
 import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundKeepAlivePacket;
 import org.geysermc.mcprotocollib.protocol.packet.configuration.clientbound.ClientboundRegistryDataPacket;
 import org.geysermc.mcprotocollib.protocol.data.game.ClientCommand;
+import org.geysermc.mcprotocollib.protocol.data.game.entity.metadata.MetadataTypes;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.Hand;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.InteractAction;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.PlayerSpawnInfo;
+import org.geysermc.mcprotocollib.protocol.data.game.entity.type.EntityType;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ClickItemAction;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ContainerAction;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ContainerActionType;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.DropItemAction;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ShiftClickItemAction;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.*;
+import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.entity.*;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.level.*;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.entity.player.*;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.inventory.*;
+import org.geysermc.mcprotocollib.protocol.data.game.PlayerListEntry;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.*;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.inventory.*;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.player.*;
@@ -67,8 +72,49 @@ public class LceBridgeSession {
     private static final int LCE_SMALL_ID         = 4; // Remote clients start at XUSER_MAX_COUNT (4) in Win64 WinsockNetLayer
     private static final int LCE_ENTITY_ID        = (LCE_SMALL_ID * 100) + 1; // = 401
     private static final long TILE_UPDATE_GRACE_MS = 2000L;
+    private static final long TELEPORT_SETTLE_MS = 200L;
+    private static final long ACTION_POSE_FLUSH_STALE_MS = 125L;
+    private static final double FORWARDED_CORRECTION_HORIZONTAL_DELTA = 0.75d;
+    private static final double FORWARDED_CORRECTION_VERTICAL_DELTA = 1.25d;
+    private static final int LCE_ITEM_ENTITY_DATA_SLOT = 10;
     private static final org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction DEFAULT_DIG_FACE =
         org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction.DOWN;
+
+    private enum TrackedEntityKind {
+        OBJECT,
+        MOB,
+        ITEM,
+        PLAYER
+    }
+
+    private static final class TrackedEntity {
+        final int entityId;
+        final TrackedEntityKind kind;
+        final int lceType;
+        int data;
+        double x;
+        double y;
+        double z;
+        float yaw;
+        float pitch;
+        float headYaw;
+        double motionX;
+        double motionY;
+        double motionZ;
+        LceItemStack itemStack;
+        boolean spawnedToLce;
+        // Player-specific fields
+        String playerName;
+        int playerIndex;
+        java.util.UUID playerUuid;
+
+        TrackedEntity(int entityId, TrackedEntityKind kind, int lceType) {
+            this.entityId = entityId;
+            this.kind = kind;
+            this.lceType = lceType;
+            this.data = -1;
+        }
+    }
 
     private final BridgeConfig  config;
     private final Channel       lceChannel;
@@ -97,9 +143,20 @@ public class LceBridgeSession {
     private volatile long lastDelimiterMs = 0L;
     private volatile long lastMovePacketMs = 0L;
     private volatile long tileUpdatesReadyAtMs = Long.MAX_VALUE;
+    private volatile long suppressPositionUntilMs = 0L;
+    private volatile long expectedCorrectionEchoUntilMs = 0L;
     private final AtomicBoolean delimiterSeen = new AtomicBoolean(false);
     private final AtomicBoolean playerMoving  = new AtomicBoolean(false);
     private volatile boolean lastOnGround = true;
+    private volatile boolean awaitingCorrectionEcho = false;
+    private volatile double expectedCorrectionEchoX = 0d;
+    private volatile double expectedCorrectionEchoY = 64d;
+    private volatile double expectedCorrectionEchoYView = 65.62d;
+    private volatile double expectedCorrectionEchoZ = 0d;
+    private volatile float expectedCorrectionEchoYaw = 0f;
+    private volatile float expectedCorrectionEchoPitch = 0f;
+    private volatile int currentCarriedSlot = 0;
+    private volatile int lastSentCarriedSlot = -1;
     private volatile int blockActionSequence  = 0;
     private volatile org.cloudburstmc.math.vector.Vector3i activeDigPos = null;
     private volatile org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction activeDigFace = DEFAULT_DIG_FACE;
@@ -108,7 +165,10 @@ public class LceBridgeSession {
     private volatile float lastJavaWalkSpeed = 0.1f;
     private final Map<Integer, Integer> containerStateIds = new ConcurrentHashMap<>();
     private final Map<Long, CachedLceChunkColumn> translatedChunkCache = new ConcurrentHashMap<>();
+    private final Map<Integer, TrackedEntity> trackedEntities = new ConcurrentHashMap<>();
+    private final Map<java.util.UUID, String> knownPlayerNames = new ConcurrentHashMap<>();
     private volatile int currentLevelIdx = 0;
+    private volatile int nextRemotePlayerIndex = 5; // Local player is 4, remote players start at 5
 
     private String playerName = "Unknown";
     private long offlineXuid  = 0L, onlineXuid = 0L;
@@ -220,10 +280,45 @@ public class LceBridgeSession {
         if (!javaSession.isConnected()) return;
         // Ignore placeholder movement before Java has told us the real spawn position.
         if (!initialTeleportHandled.get()) return;
+        long now = System.currentTimeMillis();
         boolean og = (p.flags & 0x1) != 0;
+        boolean isFlying = (p.flags & 0x2) != 0;
         lastOnGround = og;
-        lastMovePacketMs = System.currentTimeMillis();
         boolean hasPosition = p.id == 11 || p.id == 13;
+        boolean correctionEcho = hasPosition && matchesExpectedCorrectionEcho(p, now);
+        if (hasPosition && now < suppressPositionUntilMs && !correctionEcho) {
+            if (config.logPackets) {
+                log.debug(
+                    "LCE move id={} suppressed during teleport settle window until {} pos=({},{},{}) yView={} yaw={} pitch={}",
+                    p.id,
+                    suppressPositionUntilMs,
+                    p.x,
+                    p.y,
+                    p.z,
+                    p.yView,
+                    p.yaw,
+                    p.pitch
+                );
+            }
+            return;
+        }
+        if (correctionEcho) {
+            awaitingCorrectionEcho = false;
+            expectedCorrectionEchoUntilMs = 0L;
+            if (config.logPackets) {
+                log.debug(
+                    "Accepted LCE move id={} as correction echo pos=({},{},{}) yView={} yaw={} pitch={}",
+                    p.id,
+                    p.x,
+                    p.y,
+                    p.z,
+                    p.yView,
+                    p.yaw,
+                    p.pitch
+                );
+            }
+        }
+        lastMovePacketMs = now;
         boolean readyForPosition = postChunkReady.get();
         if (!readyForPosition && hasPosition) {
             if (p.id == 13) {
@@ -248,6 +343,23 @@ public class LceBridgeSession {
             lastKnownYaw = p.yaw;
             lastKnownPitch = p.pitch;
         }
+        if (config.logPackets) {
+            log.debug(
+                "LCE move id={} pos=({},{},{}) yView={} yaw={} pitch={} flags=0x{} onGround={} flying={} postChunkReady={} movedEnough={}",
+                p.id,
+                p.x,
+                p.y,
+                p.z,
+                p.yView,
+                p.yaw,
+                p.pitch,
+                Integer.toHexString(p.flags & 0xFF),
+                og,
+                isFlying,
+                readyForPosition,
+                movedEnough
+            );
+        }
         // Kill the position heartbeat on first real movement from the LCE client.
         // Only treat packets with position payload as "real movement". LCE can send
         // rotation-only packets right after spawn; stopping heartbeat on those leaves
@@ -268,14 +380,32 @@ public class LceBridgeSession {
 
     private void handleSetCarriedItem(SetCarriedItemPacket p) {
         if (!javaSession.isConnected()) return;
-        javaSession.send(new ServerboundSetCarriedItemPacket(p.slot));
+        currentCarriedSlot = p.slot;
+        ensureCarriedItemSynced();
     }
 
     private void handleUseItem(UseItemPacket p) {
         if (!javaSession.isConnected()) return;
 
+        ensureCarriedItemSynced();
         flushLatestPoseForAction();
         int sequence = ++blockActionSequence;
+        if (config.logPackets) {
+            log.debug(
+                "LCE use-item seq={} target=({}, {}, {}) face={} click=({}, {}, {}) pose=({},{},{})",
+                sequence,
+                p.x,
+                p.y,
+                p.z,
+                p.face,
+                p.clickX,
+                p.clickY,
+                p.clickZ,
+                lastKnownX,
+                lastKnownY,
+                lastKnownZ
+            );
+        }
         if (p.face == 255 || p.x == -1 || p.y == 255 || p.z == -1) {
             javaSession.send(new ServerboundUseItemPacket(Hand.MAIN_HAND, sequence, lastKnownYaw, lastKnownPitch));
             return;
@@ -291,7 +421,11 @@ public class LceBridgeSession {
     private void handleInteract(InteractPacket p) {
         if (!javaSession.isConnected()) return;
 
+        ensureCarriedItemSynced();
         flushLatestPoseForAction();
+        if (config.logPackets) {
+            log.debug("LCE interact action={} target={} pose=({},{},{})", p.action, p.target, lastKnownX, lastKnownY, lastKnownZ);
+        }
         if (p.action == 0) {
             javaSession.send(new ServerboundInteractPacket(p.target, InteractAction.INTERACT, Hand.MAIN_HAND, false));
         } else if (p.action == 1) {
@@ -301,7 +435,10 @@ public class LceBridgeSession {
 
     private void handlePlayerAction(PlayerActionPacket p) {
         if (!javaSession.isConnected()) return;
-        if (p.action == 0 || p.action == 1 || p.action == 2) {
+        ensureCarriedItemSynced();
+        // Flush position for actions that trigger server-side reach checks:
+        // START_DIGGING (0), FINISH_DIGGING (2), and block interaction actions.
+        if (p.action == 0 || p.action == 2) {
             flushLatestPoseForAction();
         }
         var action = switch (p.action) {
@@ -329,6 +466,26 @@ public class LceBridgeSession {
         }
 
         int seq = ++blockActionSequence;
+        if (config.logPackets) {
+            log.debug(
+                "LCE dig action={} seq={} raw=({}, {}, {}) rawFace={} sent=({}, {}, {}) face={} pinned={} active={} pose=({},{},{})",
+                p.action,
+                seq,
+                rawPos.getX(),
+                rawPos.getY(),
+                rawPos.getZ(),
+                p.face,
+                pos.getX(),
+                pos.getY(),
+                pos.getZ(),
+                dir,
+                shouldPinToActiveTarget,
+                activeDigPos,
+                lastKnownX,
+                lastKnownY,
+                lastKnownZ
+            );
+        }
         if (p.action == 0) {
             activeDigPos = pos;
             activeDigFace = dir;
@@ -341,9 +498,18 @@ public class LceBridgeSession {
 
     private void handlePlayerCommand(PlayerCommandPacket p) {
         if (!javaSession.isConnected()) return;
+
+        // LCE actions 1/2 (sneak) use ServerboundPlayerInputPacket in 1.21.2+
+        if (p.action == 1 || p.action == 2) {
+            boolean sneaking = (p.action == 1);
+            javaSession.send(new org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.level.ServerboundPlayerInputPacket(
+                false, false, false, false, false, sneaking, false
+            ));
+            return;
+        }
+
+        // Actions 3-5 still use ServerboundPlayerCommandPacket
         var state = switch (p.action) {
-            case 1 -> null; // no matching serverbound command in this MCProtocolLib snapshot
-            case 2 -> null;
             case 3 -> org.geysermc.mcprotocollib.protocol.data.game.entity.player.PlayerState.LEAVE_BED;
             case 4 -> org.geysermc.mcprotocollib.protocol.data.game.entity.player.PlayerState.START_SPRINTING;
             case 5 -> org.geysermc.mcprotocollib.protocol.data.game.entity.player.PlayerState.STOP_SPRINTING;
@@ -433,6 +599,16 @@ public class LceBridgeSession {
             case ClientboundChunkBatchFinishedPacket p      -> onJavaChunkBatchFinished(p);
             case ClientboundPlayerPositionPacket p          -> onJavaPlayerPosition(p);
             case ClientboundRespawnPacket p                 -> onJavaRespawn(p);
+            case ClientboundAddEntityPacket p               -> onJavaAddEntity(p);
+            case ClientboundRemoveEntitiesPacket p          -> onJavaRemoveEntities(p);
+            case ClientboundSetEntityDataPacket p           -> onJavaSetEntityData(p);
+            case ClientboundSetEntityMotionPacket p         -> onJavaSetEntityMotion(p);
+            case ClientboundEntityPositionSyncPacket p      -> onJavaEntityPositionSync(p);
+            case ClientboundMoveEntityPosPacket p           -> onJavaMoveEntityPos(p);
+            case ClientboundMoveEntityPosRotPacket p        -> onJavaMoveEntityPosRot(p);
+            case ClientboundMoveEntityRotPacket p           -> onJavaMoveEntityRot(p);
+            case ClientboundRotateHeadPacket p              -> onJavaRotateHead(p);
+            case ClientboundTeleportEntityPacket p          -> onJavaTeleportEntity(p);
             case ClientboundDelimiterPacket p               -> onJavaDelimiter(p);
             case ClientboundOpenScreenPacket p              -> onJavaOpenScreen(p);
             case ClientboundContainerSetContentPacket p     -> onJavaContainerSetContent(p);
@@ -443,6 +619,7 @@ public class LceBridgeSession {
             case ClientboundSetCursorItemPacket p           -> onJavaSetCursorItem(p);
             case ClientboundSystemChatPacket p              -> onJavaSystemChat(p);
             case ClientboundPlayerChatPacket p              -> onJavaPlayerChat(p);
+            case ClientboundPlayerInfoUpdatePacket p        -> onJavaPlayerInfoUpdate(p);
             case ClientboundDisconnectPacket p              -> onJavaDisconnect(p);
             default -> {
                 String simple = pkt.getClass().getSimpleName();
@@ -638,6 +815,16 @@ public class LceBridgeSession {
         int x = entry.getPosition().getX();
         int y = entry.getPosition().getY();
         int z = entry.getPosition().getZ();
+        if (config.logPackets) {
+            log.debug(
+                "Java block-update pos=({}, {}, {}) state={} canSendTileUpdates={}",
+                x,
+                y,
+                z,
+                entry.getBlock(),
+                canSendTileUpdates()
+            );
+        }
         if (canSendTileUpdates()) {
             sendTileUpdate(x, y, z, entry.getBlock());
             return;
@@ -650,6 +837,13 @@ public class LceBridgeSession {
 
     private void onJavaSectionBlocksUpdate(ClientboundSectionBlocksUpdatePacket p) {
         if (p.getEntries() == null) return;
+        if (config.logPackets) {
+            log.debug(
+                "Java section-blocks-update entries={} canSendTileUpdates={}",
+                p.getEntries().length,
+                canSendTileUpdates()
+            );
+        }
         if (canSendTileUpdates()) {
             for (var entry : p.getEntries()) {
                 if (entry == null || entry.getPosition() == null) continue;
@@ -774,6 +968,11 @@ public class LceBridgeSession {
         // store delta values, causing the heartbeat to send garbage and Paper's movement
         // watchdog to fire (disconnect.timeout).
         var rels = p.getRelatives();
+        double previousX = lastKnownX;
+        double previousY = lastKnownY;
+        double previousZ = lastKnownZ;
+        float previousYaw = lastKnownYaw;
+        float previousPitch = lastKnownPitch;
         double newX     = p.getPosition().getX();
         double newY     = p.getPosition().getY();
         double newZ     = p.getPosition().getZ();
@@ -791,6 +990,13 @@ public class LceBridgeSession {
         lastKnownZ     = newZ;
         lastKnownYaw   = newYaw;
         lastKnownPitch = newPitch;
+        double deltaX = newX - previousX;
+        double deltaY = newY - previousY;
+        double deltaZ = newZ - previousZ;
+        double horizontalDelta = Math.hypot(deltaX, deltaZ);
+        boolean significantHorizontalCorrection = horizontalDelta >= FORWARDED_CORRECTION_HORIZONTAL_DELTA;
+        boolean significantVerticalCorrection = Math.abs(deltaY) >= FORWARDED_CORRECTION_VERTICAL_DELTA;
+        boolean significantPositionCorrection = significantHorizontalCorrection || significantVerticalCorrection;
 
         log.info("Accepted teleport id={} abs=({},{},{}) yaw={} pitch={} relatives={}",
             p.getId(), lastKnownX, lastKnownY, lastKnownZ, lastKnownYaw, lastKnownPitch, rels);
@@ -806,6 +1012,7 @@ public class LceBridgeSession {
         // teleport arrived, send PlayerLoaded now — vanilla requires AcceptTeleportation
         // to have gone out first, and ClientInformation was already sent above.
         if (initialTeleportHandled.compareAndSet(false, true)) {
+            suppressPositionUntilMs = System.currentTimeMillis() + TELEPORT_SETTLE_MS;
             // First teleport from Java — now we have the real spawn position.
             // Mirror Java's actual abilities; do not force isFlying in survival.
             PlayerAbilitiesPacket abilities = new PlayerAbilitiesPacket();
@@ -816,6 +1023,7 @@ public class LceBridgeSession {
 
             // Send the LCE MovePlayerPosRot with the actual confirmed coordinates.
             sendLce(buildTeleport(lastKnownX, lastKnownY, lastKnownZ, lastKnownYaw, lastKnownPitch));
+            rememberExpectedCorrectionEcho(lastKnownX, lastKnownY, lastKnownZ, lastKnownYaw, lastKnownPitch);
 
             // Send health so the LCE HUD is correct from spawn.
             SetHealthPacket sh = new SetHealthPacket();
@@ -835,6 +1043,23 @@ public class LceBridgeSession {
                 javaSession.send(new ServerboundChunkBatchReceivedPacket(advertisedChunkRate()));
                 log.info("Deferred PlayerLoaded + ChunkBatchReceived sent after teleport ack");
             }
+        } else if (significantPositionCorrection) {
+            if (significantHorizontalCorrection) {
+                suppressPositionUntilMs = System.currentTimeMillis() + TELEPORT_SETTLE_MS;
+            }
+            sendLce(buildTeleport(lastKnownX, lastKnownY, lastKnownZ, lastKnownYaw, lastKnownPitch));
+            rememberExpectedCorrectionEcho(lastKnownX, lastKnownY, lastKnownZ, lastKnownYaw, lastKnownPitch);
+            log.info("Forwarded correction teleport to LCE ({},{},{}) yaw={} pitch={} delta=({},{},{})",
+                lastKnownX, lastKnownY, lastKnownZ, lastKnownYaw, lastKnownPitch, deltaX, deltaY, deltaZ);
+        } else if (config.logPackets) {
+            log.debug(
+                "Kept minor correction server-side only delta=({},{},{}) yawDelta={} pitchDelta={}",
+                deltaX,
+                deltaY,
+                deltaZ,
+                newYaw - previousYaw,
+                newPitch - previousPitch
+            );
         }
     }
 
@@ -851,10 +1076,17 @@ public class LceBridgeSession {
         teleportAcked.set(false);
         playerMoving.set(false);
         lastMovePacketMs = 0L;
+        suppressPositionUntilMs = 0L;
+        expectedCorrectionEchoUntilMs = 0L;
+        awaitingCorrectionEcho = false;
+        currentCarriedSlot = 0;
+        lastSentCarriedSlot = -1;
         lastOnGround = true;
         stopPositionHeartbeat();
         clearActiveDigState();
         translatedChunkCache.clear();
+        trackedEntities.clear();
+        nextRemotePlayerIndex = 5;
         sendLce(buildRespawnPacket());
         SetHealthPacket sh = new SetHealthPacket();
         sh.health = 20.0f;
@@ -863,6 +1095,160 @@ public class LceBridgeSession {
         sendLce(sh);
         lastHealth = 20.0f;
         log.info("Forwarded Java respawn to LCE (lceEntityId={})", LCE_ENTITY_ID);
+    }
+
+    private void onJavaAddEntity(ClientboundAddEntityPacket p) {
+        TrackedEntity tracked = trackedEntityFromAddPacket(p);
+        if (tracked == null) {
+            return;
+        }
+        trackedEntities.put(tracked.entityId, tracked);
+        if (postChunkReady.get()) {
+            spawnTrackedEntity(tracked);
+        }
+    }
+
+    private void onJavaRemoveEntities(ClientboundRemoveEntitiesPacket p) {
+        if (p.getEntityIds() == null || p.getEntityIds().length == 0) {
+            return;
+        }
+
+        List<Integer> idsToRemove = new java.util.ArrayList<>();
+        for (int entityId : p.getEntityIds()) {
+            TrackedEntity tracked = trackedEntities.remove(entityId);
+            if (tracked != null && tracked.spawnedToLce) {
+                idsToRemove.add(entityId);
+            }
+        }
+
+        if (idsToRemove.isEmpty()) {
+            return;
+        }
+
+        for (int start = 0; start < idsToRemove.size(); start += 255) {
+            RemoveEntitiesPacket remove = new RemoveEntitiesPacket();
+            remove.entityIds.addAll(idsToRemove.subList(start, Math.min(start + 255, idsToRemove.size())));
+            sendLce(remove);
+        }
+    }
+
+    private void onJavaSetEntityData(ClientboundSetEntityDataPacket p) {
+        TrackedEntity tracked = trackedEntities.get(p.getEntityId());
+        if (tracked == null || tracked.kind != TrackedEntityKind.ITEM || p.getMetadata() == null) {
+            return;
+        }
+
+        boolean changed = false;
+        for (var metadata : p.getMetadata()) {
+            if (metadata == null || metadata.getType() != MetadataTypes.ITEM_STACK) {
+                continue;
+            }
+            Object value = metadata.getValue();
+            if (!(value instanceof org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack itemStack)) {
+                continue;
+            }
+            tracked.itemStack = MappingRegistry.items().toLce(itemStack);
+            changed = true;
+        }
+
+        if (changed && tracked.spawnedToLce) {
+            sendTrackedItemMetadata(tracked);
+        }
+    }
+
+    private void onJavaSetEntityMotion(ClientboundSetEntityMotionPacket p) {
+        TrackedEntity tracked = trackedEntities.get(p.getEntityId());
+        if (tracked == null) {
+            return;
+        }
+        tracked.motionX = p.getMovement().getX();
+        tracked.motionY = p.getMovement().getY();
+        tracked.motionZ = p.getMovement().getZ();
+    }
+
+    private void onJavaEntityPositionSync(ClientboundEntityPositionSyncPacket p) {
+        TrackedEntity tracked = trackedEntities.get(p.getId());
+        if (tracked == null) {
+            return;
+        }
+        applyTrackedEntityPose(
+            tracked,
+            p.getPosition().getX(),
+            p.getPosition().getY(),
+            p.getPosition().getZ(),
+            p.getYRot(),
+            p.getXRot()
+        );
+        tracked.motionX = p.getDeltaMovement().getX();
+        tracked.motionY = p.getDeltaMovement().getY();
+        tracked.motionZ = p.getDeltaMovement().getZ();
+        emitTrackedEntityTransform(tracked);
+    }
+
+    private void onJavaMoveEntityPos(ClientboundMoveEntityPosPacket p) {
+        TrackedEntity tracked = trackedEntities.get(p.getEntityId());
+        if (tracked == null) {
+            return;
+        }
+        applyTrackedEntityPose(
+            tracked,
+            tracked.x + p.getMoveX(),
+            tracked.y + p.getMoveY(),
+            tracked.z + p.getMoveZ(),
+            tracked.yaw,
+            tracked.pitch
+        );
+        emitTrackedEntityTransform(tracked);
+    }
+
+    private void onJavaMoveEntityPosRot(ClientboundMoveEntityPosRotPacket p) {
+        TrackedEntity tracked = trackedEntities.get(p.getEntityId());
+        if (tracked == null) {
+            return;
+        }
+        applyTrackedEntityPose(
+            tracked,
+            tracked.x + p.getMoveX(),
+            tracked.y + p.getMoveY(),
+            tracked.z + p.getMoveZ(),
+            p.getYaw(),
+            p.getPitch()
+        );
+        emitTrackedEntityTransform(tracked);
+    }
+
+    private void onJavaMoveEntityRot(ClientboundMoveEntityRotPacket p) {
+        TrackedEntity tracked = trackedEntities.get(p.getEntityId());
+        if (tracked == null) {
+            return;
+        }
+        applyTrackedEntityPose(tracked, tracked.x, tracked.y, tracked.z, p.getYaw(), p.getPitch());
+        emitTrackedEntityTransform(tracked);
+    }
+
+    private void onJavaRotateHead(ClientboundRotateHeadPacket p) {
+        TrackedEntity tracked = trackedEntities.get(p.getEntityId());
+        if (tracked == null || !tracked.spawnedToLce) {
+            return;
+        }
+        tracked.headYaw = p.getHeadYaw();
+        RotateHeadPacket lce = new RotateHeadPacket();
+        lce.entityId = tracked.entityId;
+        lce.yHeadRot = angleToByte(tracked.headYaw);
+        sendLce(lce);
+    }
+
+    private void onJavaTeleportEntity(ClientboundTeleportEntityPacket p) {
+        TrackedEntity tracked = trackedEntities.get(p.getId());
+        if (tracked == null) {
+            return;
+        }
+        Vector3d pos = p.getPosition();
+        applyTrackedEntityPose(tracked, pos.getX(), pos.getY(), pos.getZ(), p.getYRot(), p.getXRot());
+        tracked.motionX = p.getDeltaMovement().getX();
+        tracked.motionY = p.getDeltaMovement().getY();
+        tracked.motionZ = p.getDeltaMovement().getZ();
+        emitTrackedEntityTransform(tracked);
     }
 
     private void onJavaSystemChat(ClientboundSystemChatPacket p) {
@@ -890,6 +1276,26 @@ public class LceBridgeSession {
             lc.setMessage("<" + name + "> " + message);
         }
         sendLce(lc);
+    }
+
+    private void onJavaPlayerInfoUpdate(ClientboundPlayerInfoUpdatePacket p) {
+        if (p.getEntries() == null) return;
+        for (PlayerListEntry entry : p.getEntries()) {
+            if (entry == null || entry.getProfileId() == null) continue;
+            // Cache player name from the GameProfile
+            if (entry.getProfile() != null && entry.getProfile().getName() != null
+                    && !entry.getProfile().getName().isBlank()) {
+                String name = entry.getProfile().getName();
+                knownPlayerNames.put(entry.getProfileId(), name);
+                // If we already have a tracked entity for this UUID, update its name
+                for (TrackedEntity tracked : trackedEntities.values()) {
+                    if (tracked.kind == TrackedEntityKind.PLAYER
+                            && entry.getProfileId().equals(tracked.playerUuid)) {
+                        tracked.playerName = name;
+                    }
+                }
+            }
+        }
     }
 
     private void sendCursorItem(org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack item) {
@@ -1069,6 +1475,272 @@ public class LceBridgeSession {
         }
     }
 
+    private TrackedEntity trackedEntityFromAddPacket(ClientboundAddEntityPacket p) {
+        if (p == null) {
+            return null;
+        }
+        int entityId = p.getEntityId();
+        if (!isSupportedLceEntityId(entityId) || entityId == LCE_ENTITY_ID) {
+            return null;
+        }
+
+        EntityType type = p.getType();
+        if (type == null) {
+            return null;
+        }
+
+        TrackedEntity tracked;
+        if (type == EntityType.PLAYER) {
+            tracked = new TrackedEntity(entityId, TrackedEntityKind.PLAYER, 0);
+            tracked.headYaw = p.getHeadYaw();
+            tracked.playerUuid = p.getUuid();
+            String cachedName = p.getUuid() != null ? knownPlayerNames.get(p.getUuid()) : null;
+            tracked.playerName = cachedName != null ? cachedName : "Player";
+            tracked.playerIndex = nextRemotePlayerIndex++;
+        } else {
+            Integer mobType = mapJavaMobType(type);
+        if (mobType != null) {
+            tracked = new TrackedEntity(entityId, TrackedEntityKind.MOB, mobType);
+            tracked.headYaw = p.getHeadYaw();
+        } else {
+            Integer objectType = mapJavaObjectType(type);
+            if (objectType == null) {
+                return null;
+            }
+            tracked = new TrackedEntity(
+                entityId,
+                type == EntityType.ITEM ? TrackedEntityKind.ITEM : TrackedEntityKind.OBJECT,
+                objectType
+            );
+            tracked.data = mapJavaObjectData(type, p.getData());
+        }
+        }
+
+        applyTrackedEntityPose(tracked, p.getX(), p.getY(), p.getZ(), p.getYaw(), p.getPitch());
+        tracked.motionX = p.getMovement().getX();
+        tracked.motionY = p.getMovement().getY();
+        tracked.motionZ = p.getMovement().getZ();
+        return tracked;
+    }
+
+    private void applyTrackedEntityPose(TrackedEntity tracked, double x, double y, double z, float yaw, float pitch) {
+        tracked.x = x;
+        tracked.y = y;
+        tracked.z = z;
+        tracked.yaw = yaw;
+        tracked.pitch = pitch;
+    }
+
+    private void emitTrackedEntityTransform(TrackedEntity tracked) {
+        if (tracked == null || !postChunkReady.get()) {
+            return;
+        }
+        if (!tracked.spawnedToLce) {
+            spawnTrackedEntity(tracked);
+            return;
+        }
+        sendLce(buildEntityTeleport(tracked));
+    }
+
+    private void spawnTrackedEntity(TrackedEntity tracked) {
+        if (tracked == null || !postChunkReady.get()) {
+            return;
+        }
+        switch (tracked.kind) {
+            case PLAYER -> {
+                AddPlayerPacket player = new AddPlayerPacket();
+                player.entityId = tracked.entityId;
+                player.name = tracked.playerName != null ? tracked.playerName : "Player";
+                player.x = toLceFixed(tracked.x);
+                player.y = toLceFixed(tracked.y);
+                player.z = toLceFixed(tracked.z);
+                player.yaw = angleToByte(tracked.yaw);
+                player.pitch = angleToByte(tracked.pitch);
+                player.headYaw = angleToByte(tracked.headYaw);
+                player.carriedItem = 0;
+                player.offlineXuid = tracked.entityId; // Use entity ID as fake XUID
+                player.onlineXuid = 0L;
+                player.playerIndex = tracked.playerIndex;
+                player.skinId = 0;
+                player.capeId = 0;
+                player.gamePrivileges = 0;
+                // Entity flags byte 0 (required — same reason as AddMobPacket)
+                player.metadata.add(new SetEntityDataPacket.DataValue(
+                    0,
+                    SetEntityDataPacket.TYPE_BYTE,
+                    0
+                ));
+                sendLce(player);
+                log.info("Spawned player entity '{}' id={} at ({},{},{}) playerIndex={}",
+                    player.name, tracked.entityId, tracked.x, tracked.y, tracked.z, tracked.playerIndex);
+            }
+            case MOB -> {
+                AddMobPacket mob = new AddMobPacket();
+                mob.entityId = tracked.entityId;
+                mob.type = tracked.lceType;
+                mob.x = toLceFixed(tracked.x);
+                mob.y = toLceFixed(tracked.y);
+                mob.z = toLceFixed(tracked.z);
+                mob.yaw = angleToByte(tracked.yaw);
+                mob.pitch = angleToByte(tracked.pitch);
+                mob.headYaw = angleToByte(tracked.headYaw);
+                mob.motionX = velocityToLce(tracked.motionX);
+                mob.motionY = velocityToLce(tracked.motionY);
+                mob.motionZ = velocityToLce(tracked.motionZ);
+                // LCE's AddMobPacket client path crashes if the metadata payload is completely
+                // empty because it later falls back to a null server-side entityData pointer.
+                // Send the base entity flags entry explicitly, even when all flags are zero.
+                mob.metadata.add(new SetEntityDataPacket.DataValue(
+                    0,
+                    SetEntityDataPacket.TYPE_BYTE,
+                    0
+                ));
+                sendLce(mob);
+            }
+            case ITEM, OBJECT -> {
+                AddEntityPacket entity = new AddEntityPacket();
+                entity.entityId = tracked.entityId;
+                entity.type = tracked.lceType;
+                entity.x = toLceFixed(tracked.x);
+                entity.y = toLceFixed(tracked.y);
+                entity.z = toLceFixed(tracked.z);
+                entity.yaw = angleToByte(tracked.yaw);
+                entity.pitch = angleToByte(tracked.pitch);
+                entity.data = tracked.data;
+                entity.motionX = velocityToLce(tracked.motionX);
+                entity.motionY = velocityToLce(tracked.motionY);
+                entity.motionZ = velocityToLce(tracked.motionZ);
+                sendLce(entity);
+                if (tracked.kind == TrackedEntityKind.ITEM && tracked.itemStack != null) {
+                    sendTrackedItemMetadata(tracked);
+                }
+            }
+        }
+        tracked.spawnedToLce = true;
+    }
+
+    private void sendPendingTrackedEntities() {
+        if (!postChunkReady.get()) {
+            return;
+        }
+        for (TrackedEntity tracked : trackedEntities.values()) {
+            if (!tracked.spawnedToLce) {
+                spawnTrackedEntity(tracked);
+            }
+        }
+    }
+
+    private void sendTrackedItemMetadata(TrackedEntity tracked) {
+        if (tracked == null || tracked.kind != TrackedEntityKind.ITEM || !tracked.spawnedToLce) {
+            return;
+        }
+        SetEntityDataPacket metadata = new SetEntityDataPacket();
+        metadata.entityId = tracked.entityId;
+        metadata.values.add(new SetEntityDataPacket.DataValue(
+            LCE_ITEM_ENTITY_DATA_SLOT,
+            SetEntityDataPacket.TYPE_ITEMINSTANCE,
+            tracked.itemStack
+        ));
+        sendLce(metadata);
+    }
+
+    private TeleportEntityPacket buildEntityTeleport(TrackedEntity tracked) {
+        TeleportEntityPacket teleport = new TeleportEntityPacket();
+        teleport.entityId = tracked.entityId;
+        teleport.x = toLceFixed(tracked.x);
+        teleport.y = toLceFixed(tracked.y);
+        teleport.z = toLceFixed(tracked.z);
+        teleport.yaw = angleToByte(tracked.yaw);
+        teleport.pitch = angleToByte(tracked.pitch);
+        return teleport;
+    }
+
+    private boolean isSupportedLceEntityId(int entityId) {
+        return entityId >= 0 && entityId <= 0x7FFF;
+    }
+
+    private int toLceFixed(double value) {
+        return (int) Math.floor(value * 32.0d);
+    }
+
+    private int angleToByte(float angle) {
+        return ((int) (angle * 256.0f / 360.0f)) & 0xFF;
+    }
+
+    private int velocityToLce(double velocity) {
+        double clamped = Math.max(-3.9d, Math.min(3.9d, velocity));
+        return (int) Math.round(clamped * 8000.0d);
+    }
+
+    private Integer mapJavaMobType(EntityType type) {
+        return switch (type) {
+            case CREEPER -> 50;
+            case SKELETON -> 51;
+            case SPIDER -> 52;
+            case ZOMBIE -> 54;
+            case ZOMBIFIED_PIGLIN -> 57;
+            case CAVE_SPIDER -> 59;
+            case PIG -> 90;
+            case SHEEP -> 91;
+            case COW -> 92;
+            case CHICKEN -> 93;
+            case MOOSHROOM -> 96;
+            case IRON_GOLEM -> 99;
+            case VILLAGER -> 120;
+            default -> null;
+        };
+    }
+
+    private Integer mapJavaObjectType(EntityType type) {
+        return switch (type) {
+            case ITEM -> AddEntityPacket.ITEM;
+            case ARROW, SPECTRAL_ARROW, TRIDENT -> AddEntityPacket.ARROW;
+            case SNOWBALL -> AddEntityPacket.SNOWBALL;
+            case EGG -> AddEntityPacket.EGG;
+            case FIREBALL -> AddEntityPacket.FIREBALL;
+            case SMALL_FIREBALL -> AddEntityPacket.SMALL_FIREBALL;
+            case ENDER_PEARL -> AddEntityPacket.THROWN_ENDERPEARL;
+            case WITHER_SKULL -> AddEntityPacket.WITHER_SKULL;
+            case FALLING_BLOCK -> AddEntityPacket.FALLING;
+            case ITEM_FRAME, GLOW_ITEM_FRAME -> AddEntityPacket.ITEM_FRAME;
+            case EYE_OF_ENDER -> AddEntityPacket.EYEOFENDERSIGNAL;
+            case SPLASH_POTION, LINGERING_POTION -> AddEntityPacket.THROWN_POTION;
+            case EXPERIENCE_BOTTLE -> AddEntityPacket.THROWN_EXPBOTTLE;
+            case FIREWORK_ROCKET -> AddEntityPacket.FIREWORKS;
+            case LEASH_KNOT -> AddEntityPacket.LEASH_KNOT;
+            case FISHING_BOBBER -> AddEntityPacket.FISH_HOOK;
+            case TNT -> AddEntityPacket.PRIMED_TNT;
+            case END_CRYSTAL -> AddEntityPacket.ENDER_CRYSTAL;
+            default -> null;
+        };
+    }
+
+    private int mapJavaObjectData(EntityType type,
+                                  org.geysermc.mcprotocollib.protocol.data.game.entity.object.ObjectData javaData) {
+        if (javaData == null) {
+            return -1;
+        }
+        return switch (type) {
+            case FALLING_BLOCK -> {
+                if (javaData instanceof org.geysermc.mcprotocollib.protocol.data.game.entity.object.FallingBlockData data) {
+                    int legacyState = data.getId();
+                    int legacyMeta = data.getMetadata() & 0xF;
+                    yield (legacyState << 4) | legacyMeta;
+                }
+                yield -1;
+            }
+            default -> {
+                if (javaData instanceof org.geysermc.mcprotocollib.protocol.data.game.entity.object.GenericObjectData data) {
+                    yield data.getValue();
+                }
+                if (javaData instanceof org.geysermc.mcprotocollib.protocol.data.game.entity.object.ProjectileData data) {
+                    yield data.getOwnerId();
+                }
+                yield -1;
+            }
+        };
+    }
+
     private org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction directionFromFaceIndex(int faceIndex) {
         var dirValues = org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction.values();
         int idx = Math.max(0, Math.min(faceIndex, dirValues.length - 1));
@@ -1103,15 +1775,67 @@ public class LceBridgeSession {
         if (!initialTeleportHandled.get()) {
             return;
         }
+        long now = System.currentTimeMillis();
+        if (now < suppressPositionUntilMs) {
+            return;
+        }
+        if (lastMovePacketMs != 0L && (now - lastMovePacketMs) < ACTION_POSE_FLUSH_STALE_MS) {
+            return;
+        }
         javaSession.send(new ServerboundMovePlayerPosRotPacket(
             lastOnGround, false, lastKnownX, lastKnownY, lastKnownZ, lastKnownYaw, lastKnownPitch
         ));
-        lastMovePacketMs = System.currentTimeMillis();
+        lastMovePacketMs = now;
+    }
+
+    private void ensureCarriedItemSynced() {
+        if (lastSentCarriedSlot == currentCarriedSlot) {
+            return;
+        }
+        javaSession.send(new ServerboundSetCarriedItemPacket(currentCarriedSlot));
+        lastSentCarriedSlot = currentCarriedSlot;
     }
 
     private void clearActiveDigState() {
         activeDigPos = null;
         activeDigFace = DEFAULT_DIG_FACE;
+    }
+
+    private void rememberExpectedCorrectionEcho(double x, double y, double z, float yaw, float pitch) {
+        expectedCorrectionEchoX = x;
+        expectedCorrectionEchoY = y;
+        expectedCorrectionEchoYView = y + 1.62d;
+        expectedCorrectionEchoZ = z;
+        expectedCorrectionEchoYaw = yaw;
+        expectedCorrectionEchoPitch = pitch;
+        expectedCorrectionEchoUntilMs = System.currentTimeMillis() + TELEPORT_SETTLE_MS;
+        awaitingCorrectionEcho = true;
+    }
+
+    private boolean matchesExpectedCorrectionEcho(MovePlayerPacket p, long now) {
+        if (!awaitingCorrectionEcho || now > expectedCorrectionEchoUntilMs) {
+            return false;
+        }
+        if (p.id != 11 && p.id != 13) {
+            return false;
+        }
+        boolean positionMatches = Math.abs(p.x - expectedCorrectionEchoX) <= 0.125d
+            && Math.abs(p.y - expectedCorrectionEchoY) <= 0.125d
+            && Math.abs(p.z - expectedCorrectionEchoZ) <= 0.125d
+            && Math.abs(p.yView - expectedCorrectionEchoYView) <= 0.2d;
+        if (!positionMatches) {
+            return false;
+        }
+        if (p.id == 13) {
+            return angularDistanceDegrees(p.yaw, expectedCorrectionEchoYaw) <= 6.0f
+                && angularDistanceDegrees(p.pitch, expectedCorrectionEchoPitch) <= 6.0f;
+        }
+        return true;
+    }
+
+    private float angularDistanceDegrees(float a, float b) {
+        float delta = Math.abs(a - b) % 360.0f;
+        return delta > 180.0f ? 360.0f - delta : delta;
     }
 
     private void onJavaDisconnected() {
@@ -1121,6 +1845,11 @@ public class LceBridgeSession {
         tileUpdatesReadyAtMs = Long.MAX_VALUE;
         playerMoving.set(false);
         lastMovePacketMs = 0L;
+        suppressPositionUntilMs = 0L;
+        expectedCorrectionEchoUntilMs = 0L;
+        awaitingCorrectionEcho = false;
+        currentCarriedSlot = 0;
+        lastSentCarriedSlot = -1;
         lastOnGround = true;
         initialTeleportHandled.set(false);
         postChunkSpawnSent.set(false);
@@ -1129,6 +1858,9 @@ public class LceBridgeSession {
         blockActionSequence = 0;
         clearActiveDigState();
         translatedChunkCache.clear();
+        trackedEntities.clear();
+        knownPlayerNames.clear();
+        nextRemotePlayerIndex = 5;
         sendLce(makeDisconnect(2));
         lceChannel.close();
     }
@@ -1337,8 +2069,19 @@ public class LceBridgeSession {
                 if (lastMovePacketMs != 0L && idleMs < 750L) {
                     return;
                 }
-                javaSession.send(new ServerboundMovePlayerStatusOnlyPacket(lastOnGround, false));
-                log.debug("Idle heartbeat sent at abs ({},{},{}) onGround={}", lastKnownX, lastKnownY, lastKnownZ, lastOnGround);
+                // Send full PosRot every ~5s to keep Java's internal position in sync.
+                // Without this, the server's position can drift during idle mining, causing
+                // reach-check failures on STOP_DIGGING and "moved wrongly" corrections.
+                // In between, send StatusOnly to confirm onGround without wasting bandwidth.
+                if (idleMs > 5000L || lastMovePacketMs == 0L) {
+                    javaSession.send(new ServerboundMovePlayerPosRotPacket(
+                        lastOnGround, false, lastKnownX, lastKnownY, lastKnownZ, lastKnownYaw, lastKnownPitch
+                    ));
+                    log.debug("Full pos heartbeat at ({},{},{}) onGround={}", lastKnownX, lastKnownY, lastKnownZ, lastOnGround);
+                } else {
+                    javaSession.send(new ServerboundMovePlayerStatusOnlyPacket(lastOnGround, false));
+                    log.debug("Idle heartbeat sent at abs ({},{},{}) onGround={}", lastKnownX, lastKnownY, lastKnownZ, lastOnGround);
+                }
             } catch (Exception e) {
                 log.error("Position heartbeat lambda threw — task will be silently cancelled without this catch!", e);
             }
@@ -1414,6 +2157,7 @@ public class LceBridgeSession {
             pendingSetHealth = null;
         }
 
+        sendPendingTrackedEntities();
         log.info("Post-chunk spawn complete for '{}'", playerName);
     }
 

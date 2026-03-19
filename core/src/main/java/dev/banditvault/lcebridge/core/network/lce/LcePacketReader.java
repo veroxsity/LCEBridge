@@ -141,7 +141,7 @@ public class LcePacketReader {
         if (id == 11 || id == 13) {
             p.x = r.readDouble();
             p.y = r.readDouble();
-            r.readDouble();
+            p.yView = r.readDouble();
             p.z = r.readDouble();
         }
         if (id == 12 || id == 13) {

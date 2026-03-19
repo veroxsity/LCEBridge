@@ -10,7 +10,7 @@ package dev.banditvault.lcebridge.core.network.lce;
  */
 public class MovePlayerPacket implements LcePacket {
     public final int id;
-    public double x, y, z;   // world coordinates (metres), from readDouble()
+    public double x, y, yView, z;   // world coordinates (metres), from readDouble()
     public float yaw, pitch;  // degrees
     public byte flags;        // bit0=onGround, bit1=isFlying
 
