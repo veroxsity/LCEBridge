@@ -1,5 +1,8 @@
 package dev.banditvault.lcebridge.core.session;
 
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import dev.banditvault.lcebridge.core.BridgeConfig;
 import dev.banditvault.lcebridge.core.chunk.CachedLceChunkColumn;
 import dev.banditvault.lcebridge.core.chunk.RleZlibCompressor;
@@ -54,6 +57,11 @@ import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.Serverbound
 import org.geysermc.mcprotocollib.protocol.data.game.setting.ChatVisibility;
 import org.geysermc.mcprotocollib.protocol.data.game.setting.ParticleStatus;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.HandPreference;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.BitSet;
 import java.util.HashMap;
 import java.util.List;
@@ -68,6 +76,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class LceBridgeSession {
     private static final Logger log = LoggerFactory.getLogger(LceBridgeSession.class);
+    private static final Map<String, String> CHAT_TRANSLATIONS = loadChatTranslations();
     private static final int LCE_NET_VERSION      = 560;
     private static final int LCE_PROTOCOL_VERSION = 78;
     private static final int LCE_CHAT_MAX_CHARS   = 119;
@@ -1333,7 +1342,10 @@ public class LceBridgeSession {
         if (!config.forwardChat) return;
         if (!spawnFinished.get()) return; // don't send chat before LCE client is in-world
         if (p.isOverlay()) return;
-        sendChatToLce(componentToPlain(p.getContent()));
+        if (trySendNativeLceSystemChat(p.getContent())) {
+            return;
+        }
+        sendChatToLce(componentToChatText(p.getContent()));
     }
 
     private void onJavaPlayerChat(ClientboundPlayerChatPacket p) {
@@ -1341,14 +1353,47 @@ public class LceBridgeSession {
         if (!spawnFinished.get()) return; // don't send chat before LCE client is in-world
         net.kyori.adventure.text.Component body = p.getUnsignedContent() != null
             ? p.getUnsignedContent() : net.kyori.adventure.text.Component.text(p.getContent());
-        String name = componentToPlain(p.getName()).trim();
-        String message = componentToPlain(body).trim();
+        String name = componentToChatText(p.getName()).trim();
+        String message = componentToChatText(body).trim();
         if (message.isEmpty()) return;
         if (name.isEmpty()) {
             sendChatToLce(message);
         } else {
             sendChatToLce("<" + name + "> " + message);
         }
+    }
+
+    private boolean trySendNativeLceSystemChat(net.kyori.adventure.text.Component content) {
+        if (!(content instanceof net.kyori.adventure.text.TranslatableComponent tc)) {
+            return false;
+        }
+
+        return switch (tc.key()) {
+            case "multiplayer.player.joined" -> sendNativeLceChat((short) 8, tc);
+            case "multiplayer.player.left" -> sendNativeLceChat((short) 7, tc);
+            default -> false;
+        };
+    }
+
+    private boolean sendNativeLceChat(short messageType, net.kyori.adventure.text.TranslatableComponent tc) {
+        java.util.List<String> args = new java.util.ArrayList<>();
+        for (net.kyori.adventure.text.TranslationArgument arg : tc.arguments()) {
+            String text = sanitizeLceChat(translationArgumentToChatText(arg));
+            if (!text.isEmpty()) {
+                args.add(text);
+            }
+        }
+        if (args.isEmpty()) {
+            return false;
+        }
+
+        ChatPacket lc = new ChatPacket();
+        lc.messageType = messageType;
+        lc.stringArgs.clear();
+        lc.intArgs.clear();
+        lc.stringArgs.addAll(args);
+        sendLce(lc);
+        return true;
     }
 
     private void sendChatToLce(String rawText) {
@@ -1692,6 +1737,135 @@ public class LceBridgeSession {
         return sb.toString();
     }
 
+    private static String componentToChatText(net.kyori.adventure.text.Component c) {
+        if (c == null) {
+            return "";
+        }
+
+        StringBuilder sb = new StringBuilder();
+        if (c instanceof net.kyori.adventure.text.TextComponent tc) {
+            sb.append(tc.content());
+        } else if (c instanceof net.kyori.adventure.text.TranslatableComponent tc) {
+            String translated = translateChatKey(tc);
+            if (translated != null) {
+                sb.append(translated);
+            } else if (tc.fallback() != null && !tc.fallback().isBlank()) {
+                sb.append(tc.fallback());
+            } else {
+                sb.append(tc.key());
+                for (net.kyori.adventure.text.TranslationArgument arg : tc.arguments()) {
+                    String plainArg = translationArgumentToChatText(arg);
+                    if (!plainArg.isBlank()) {
+                        sb.append(' ').append(plainArg);
+                    }
+                }
+            }
+        } else if (c instanceof net.kyori.adventure.text.KeybindComponent kc) {
+            sb.append(kc.keybind());
+        } else if (c instanceof net.kyori.adventure.text.ScoreComponent sc) {
+            if (sc.value() != null && !sc.value().isBlank()) {
+                sb.append(sc.value());
+            } else {
+                sb.append(sc.name());
+            }
+        } else if (c instanceof net.kyori.adventure.text.SelectorComponent sc) {
+            sb.append(sc.pattern());
+        } else if (c instanceof net.kyori.adventure.text.NBTComponent<?, ?> nc) {
+            sb.append(nc.nbtPath());
+        } else if (c instanceof net.kyori.adventure.text.ObjectComponent oc && oc.contents() != null) {
+            sb.append(String.valueOf(oc.contents()));
+        }
+
+        for (net.kyori.adventure.text.Component child : c.children()) {
+            sb.append(componentToChatText(child));
+        }
+        return sb.toString();
+    }
+
+    private static String translateChatKey(net.kyori.adventure.text.TranslatableComponent tc) {
+        java.util.List<String> args = new java.util.ArrayList<>();
+        for (net.kyori.adventure.text.TranslationArgument arg : tc.arguments()) {
+            args.add(translationArgumentToChatText(arg));
+        }
+
+        String template = CHAT_TRANSLATIONS.get(tc.key());
+        return template == null ? null : formatChatTemplate(template, args);
+    }
+
+    private static String formatChatTemplate(String template, java.util.List<String> args) {
+        if (template == null || template.isEmpty()) {
+            return "";
+        }
+
+        StringBuilder formatted = new StringBuilder(template.length() + (args.size() * 16));
+        int nextImplicitArg = 0;
+        for (int i = 0; i < template.length(); i++) {
+            char ch = template.charAt(i);
+            if (ch != '%') {
+                formatted.append(ch);
+                continue;
+            }
+
+            if (i + 1 >= template.length()) {
+                formatted.append(ch);
+                continue;
+            }
+
+            char next = template.charAt(i + 1);
+            if (next == '%') {
+                formatted.append('%');
+                i++;
+                continue;
+            }
+
+            int argIndex = -1;
+            int cursor = i + 1;
+            int explicitIndex = 0;
+            while (cursor < template.length() && Character.isDigit(template.charAt(cursor))) {
+                explicitIndex = (explicitIndex * 10) + (template.charAt(cursor) - '0');
+                cursor++;
+            }
+
+            if (cursor + 1 < template.length() && cursor > i + 1
+                    && template.charAt(cursor) == '$' && template.charAt(cursor + 1) == 's') {
+                argIndex = explicitIndex - 1;
+                i = cursor + 1;
+            } else if (next == 's') {
+                argIndex = nextImplicitArg++;
+                i++;
+            } else {
+                formatted.append(ch);
+                continue;
+            }
+
+            if (argIndex >= 0 && argIndex < args.size()) {
+                formatted.append(args.get(argIndex));
+            }
+        }
+        return formatted.toString();
+    }
+
+    private static Map<String, String> loadChatTranslations() {
+        try (InputStream stream = LceBridgeSession.class.getClassLoader().getResourceAsStream("lang/chat_en_us.json")) {
+            if (stream == null) {
+                log.warn("Missing chat translation bundle: lang/chat_en_us.json");
+                return Collections.emptyMap();
+            }
+
+            JsonObject root = JsonParser.parseReader(new InputStreamReader(stream, StandardCharsets.UTF_8)).getAsJsonObject();
+            Map<String, String> translations = new HashMap<>();
+            for (Map.Entry<String, JsonElement> entry : root.entrySet()) {
+                if (entry.getValue().isJsonPrimitive()) {
+                    translations.put(entry.getKey(), entry.getValue().getAsString());
+                }
+            }
+            return Collections.unmodifiableMap(translations);
+        } catch (IOException | RuntimeException e) {
+            log.warn("Failed to load chat translation bundle", e);
+            return Collections.emptyMap();
+        }
+    }
+
     private static String translationArgumentToPlain(net.kyori.adventure.text.TranslationArgument arg) {
         if (arg == null) {
             return "";
@@ -1699,6 +1873,17 @@ public class LceBridgeSession {
         Object value = arg.value();
         if (value instanceof net.kyori.adventure.text.ComponentLike componentLike) {
             return componentToPlain(componentLike.asComponent());
+        }
+        return value == null ? "" : String.valueOf(value);
+    }
+
+    private static String translationArgumentToChatText(net.kyori.adventure.text.TranslationArgument arg) {
+        if (arg == null) {
+            return "";
+        }
+        Object value = arg.value();
+        if (value instanceof net.kyori.adventure.text.ComponentLike componentLike) {
+            return componentToChatText(componentLike.asComponent());
         }
         return value == null ? "" : String.valueOf(value);
     }
