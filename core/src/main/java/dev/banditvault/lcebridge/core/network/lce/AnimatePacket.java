@@ -8,6 +8,7 @@ public class AnimatePacket implements LcePacket {
     public static final int ID = 18;
     public int entityId;
     public int action;
+    public int targetEntityId = -1; // Win64 extra: entity being targeted (-1 = none)
 
     @Override
     public int getId() {

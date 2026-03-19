@@ -31,4 +31,5 @@ public class LceByteReader {
 
     public int readableBytes() { return buf.readableBytes(); }
     public void skipBytes(int count) { buf.skipBytes(Math.max(0, Math.min(count, buf.readableBytes()))); }
+    public ByteBuf buffer() { return buf; }
 }

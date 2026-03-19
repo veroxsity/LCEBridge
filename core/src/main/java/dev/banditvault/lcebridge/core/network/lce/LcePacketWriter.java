@@ -37,6 +37,7 @@ public class LcePacketWriter {
             case AddMobPacket p -> writeAddMob(p, w);
             case TeleportEntityPacket p -> writeTeleportEntity(p, w);
             case RotateHeadPacket p -> writeRotateHead(p, w);
+            case SetEntityMotionPacket p -> writeSetEntityMotion(p, w);
             case RemoveEntitiesPacket p -> writeRemoveEntities(p, w);
             case SetEntityDataPacket p -> writeSetEntityData(p, w);
             default -> throw new IllegalArgumentException("No encoder for LCE packet id=" + pkt.getId());
@@ -285,6 +286,25 @@ public class LcePacketWriter {
         w.writeByte(RotateHeadPacket.ID);
         w.writeInt(p.entityId);
         w.writeByte(p.yHeadRot);
+    }
+
+    private static void writeSetEntityMotion(SetEntityMotionPacket p, LceByteWriter w) {
+        w.writeByte(SetEntityMotionPacket.ID);
+        // 4J compact mode: if all velocities fit in signed bytes (*16), use 0x800 flag
+        boolean compact = (p.xa >= -2048 && p.xa < 2048)
+                        && (p.ya >= -2048 && p.ya < 2048)
+                        && (p.za >= -2048 && p.za < 2048);
+        if (compact) {
+            w.writeShort(p.entityId | 0x800);
+            w.writeByte(p.xa / 16);
+            w.writeByte(p.ya / 16);
+            w.writeByte(p.za / 16);
+        } else {
+            w.writeShort(p.entityId);
+            w.writeShort(p.xa);
+            w.writeShort(p.ya);
+            w.writeShort(p.za);
+        }
     }
 
     private static void writeRemoveEntities(RemoveEntitiesPacket p, LceByteWriter w) {

@@ -34,6 +34,7 @@ import org.geysermc.mcprotocollib.protocol.data.game.PlayerListEntry;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.*;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.inventory.*;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.player.*;
+import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.player.ServerboundSwingPacket;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.ClientboundLoginPacket;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.ClientboundBundlePacket;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.ServerboundPlayerLoadedPacket;
@@ -169,6 +170,7 @@ public class LceBridgeSession {
     private final Map<java.util.UUID, String> knownPlayerNames = new ConcurrentHashMap<>();
     private volatile int currentLevelIdx = 0;
     private volatile int nextRemotePlayerIndex = 5; // Local player is 4, remote players start at 5
+    private volatile int javaEntityId = -1; // The player's entity ID on the Java server
 
     private String playerName = "Unknown";
     private long offlineXuid  = 0L, onlineXuid = 0L;
@@ -261,6 +263,19 @@ public class LceBridgeSession {
 
     private void handleAnimate(AnimatePacket p) {
         if (!javaSession.isConnected()) return;
+        // LCE action=1 is arm swing — Java requires this for attacks to register
+        if (p.action == 1) {
+            ensureCarriedItemSynced();
+            flushLatestPoseForAction();
+            javaSession.send(new ServerboundSwingPacket(Hand.MAIN_HAND));
+
+            // Win64 LCE bundles target entity info in the AnimatePacket.
+            // If we have a valid target, send ATTACK.
+            if (p.targetEntityId > 0 && p.targetEntityId != LCE_ENTITY_ID) {
+                javaSession.send(new ServerboundInteractPacket(p.targetEntityId, InteractAction.ATTACK, false));
+                log.info("Forwarded LCE attack on entity {} from AnimatePacket", p.targetEntityId);
+            }
+        }
         // Some LCE builds signal respawn via Animate action=4.
         if (p.action == 4) {
             javaSession.send(new ServerboundClientCommandPacket(ClientCommand.RESPAWN));
@@ -429,6 +444,8 @@ public class LceBridgeSession {
         if (p.action == 0) {
             javaSession.send(new ServerboundInteractPacket(p.target, InteractAction.INTERACT, Hand.MAIN_HAND, false));
         } else if (p.action == 1) {
+            // Java requires both swing and interact for damage to register
+            javaSession.send(new ServerboundSwingPacket(Hand.MAIN_HAND));
             javaSession.send(new ServerboundInteractPacket(p.target, InteractAction.ATTACK, false));
         }
     }
@@ -658,6 +675,7 @@ public class LceBridgeSession {
 
     private void onJavaInGameLogin(ClientboundLoginPacket p) {
         log.info("Java in-game login entityId={}", p.getEntityId());
+        javaEntityId = p.getEntityId();
         if (loggedIn.getAndSet(true)) return;
         updateLevelIdx(p.getCommonPlayerSpawnInfo());
         startClientTickLoop();
@@ -743,6 +761,17 @@ public class LceBridgeSession {
             log.debug("GameEvent: {}", p.getNotification());
         }
         switch (p.getNotification().name()) {
+            case "CHANGE_GAME_MODE" -> {
+                // Java sends GameMode as the value (ordinal: 0=survival, 1=creative, 2=adventure, 3=spectator)
+                if (p.getValue() instanceof org.geysermc.mcprotocollib.protocol.data.game.entity.player.GameMode gm) {
+                    GameEventPacket ge = new GameEventPacket();
+                    ge.reason = 3; // LCE CHANGE_GAME_MODE
+                    ge.param = (byte) gm.ordinal();
+                    sendLce(ge);
+                    log.info("Forwarded gamemode change to LCE: {} (ordinal={})", gm, gm.ordinal());
+                }
+                return;
+            }
             case "LEVEL_CHUNKS_LOAD_START" -> {
                 // Record the time we saw this event so the watchdog knows to start nudging.
                 chunkLoadStartMs = System.currentTimeMillis();
@@ -1157,6 +1186,21 @@ public class LceBridgeSession {
     }
 
     private void onJavaSetEntityMotion(ClientboundSetEntityMotionPacket p) {
+        // Check if this velocity update is for the local player (knockback)
+        if (p.getEntityId() == javaEntityId) {
+            SetEntityMotionPacket lce = new SetEntityMotionPacket();
+            lce.entityId = LCE_ENTITY_ID;
+            lce.xa = velocityToLce(p.getMovement().getX());
+            lce.ya = velocityToLce(p.getMovement().getY());
+            lce.za = velocityToLce(p.getMovement().getZ());
+            sendLce(lce);
+            if (config.logPackets) {
+                log.debug("Forwarded player knockback to LCE: ({},{},{})",
+                    p.getMovement().getX(), p.getMovement().getY(), p.getMovement().getZ());
+            }
+            return;
+        }
+
         TrackedEntity tracked = trackedEntities.get(p.getEntityId());
         if (tracked == null) {
             return;
@@ -1321,8 +1365,13 @@ public class LceBridgeSession {
         ContainerOpenPacket open = new ContainerOpenPacket();
         open.containerId = p.getContainerId();
         String title = p.getTitle() == null ? "" : componentToPlain(p.getTitle());
-        open.customName = !title.isBlank();
-        open.title = title;
+
+        // If the title is a vanilla translation key (e.g. "container.chest", "block.minecraft.furnace"),
+        // it's not a custom name — let the LCE client use its built-in translations.
+        boolean isTranslationKey = title.startsWith("container.") || title.startsWith("block.")
+                || title.startsWith("entity.") || title.startsWith("item.");
+        open.customName = !title.isBlank() && !isTranslationKey;
+        open.title = open.customName ? title : "";
 
         return switch (p.getType()) {
             case GENERIC_9X1 -> configureContainer(open, ContainerOpenPacket.CONTAINER, 9);
