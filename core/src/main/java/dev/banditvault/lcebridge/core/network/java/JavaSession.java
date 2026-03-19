@@ -1,6 +1,7 @@
 package dev.banditvault.lcebridge.core.network.java;
 
 import dev.banditvault.lcebridge.core.BridgeConfig;
+import org.geysermc.mcprotocollib.auth.GameProfile;
 import org.geysermc.mcprotocollib.network.Session;
 import org.geysermc.mcprotocollib.network.event.session.*;
 import org.geysermc.mcprotocollib.network.factory.ClientNetworkSessionFactory;
@@ -11,6 +12,7 @@ import org.geysermc.mcprotocollib.protocol.MinecraftProtocol;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.UUID;
 import java.util.function.Consumer;
 
 public class JavaSession {
@@ -32,7 +34,7 @@ public class JavaSession {
     public void setUsername(String name)               { this.username = name; }
 
     public void connect() {
-        MinecraftProtocol protocol = new MinecraftProtocol(username);
+        MinecraftProtocol protocol = buildProtocol();
         session = ClientNetworkSessionFactory.factory()
             .setAddress(config.remoteAddress, config.remotePort)
             .setProtocol(protocol)
@@ -62,6 +64,27 @@ public class JavaSession {
         session.connect();
         log.info("Connecting to Java server {}:{} as '{}'",
             config.remoteAddress, config.remotePort, username);
+    }
+
+    private MinecraftProtocol buildProtocol() {
+        if ("online".equalsIgnoreCase(config.authType)) {
+            if (config.minecraftProfileId == null || config.minecraftProfileId.isBlank()) {
+                throw new IllegalStateException("Remote auth-type=online but minecraft-profile-id was not configured.");
+            }
+            if (config.minecraftProfileName == null || config.minecraftProfileName.isBlank()) {
+                throw new IllegalStateException("Remote auth-type=online but minecraft-profile-name was not configured.");
+            }
+            if (config.minecraftAccessToken == null || config.minecraftAccessToken.isBlank()) {
+                throw new IllegalStateException("Remote auth-type=online but minecraft-access-token was not configured.");
+            }
+
+            this.username = config.minecraftProfileName;
+            GameProfile profile = new GameProfile(UUID.fromString(config.minecraftProfileId), config.minecraftProfileName);
+            log.info("Using launcher-provided online session for '{}'", config.minecraftProfileName);
+            return new MinecraftProtocol(profile, config.minecraftAccessToken);
+        }
+
+        return new MinecraftProtocol(username);
     }
 
     public void send(Packet pkt) {

@@ -28,6 +28,9 @@ public class ConfigLoader {
             cfg.remoteAddress = str(remote, "address",    cfg.remoteAddress);
             cfg.remotePort    = integer(remote, "port",   cfg.remotePort);
             cfg.authType      = str(remote, "auth-type",  cfg.authType);
+            cfg.minecraftProfileId = str(remote, "minecraft-profile-id", cfg.minecraftProfileId);
+            cfg.minecraftProfileName = str(remote, "minecraft-profile-name", cfg.minecraftProfileName);
+            cfg.minecraftAccessToken = str(remote, "minecraft-access-token", cfg.minecraftAccessToken);
 
             Map<String, Object> world = section(root, "world");
             cfg.worldSizeLimit    = integer(world, "world-size-limit",    cfg.worldSizeLimit);

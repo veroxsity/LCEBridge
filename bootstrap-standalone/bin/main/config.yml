@@ -13,6 +13,9 @@ remote:
   port: 25566
   # online, offline, floodgate
   auth-type: offline
+  minecraft-profile-id: ""
+  minecraft-profile-name: ""
+  minecraft-access-token: ""
 
 floodgate:
   key-file: key.pem

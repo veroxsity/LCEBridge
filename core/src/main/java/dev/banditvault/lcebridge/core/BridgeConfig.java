@@ -16,6 +16,9 @@ public class BridgeConfig {
     public String remoteAddress  = "127.0.0.1";
     public int    remotePort     = 25566;
     public String authType       = "offline"; // offline | online | floodgate
+    public String minecraftProfileId = "";
+    public String minecraftProfileName = "";
+    public String minecraftAccessToken = "";
 
     // World
     public int    worldSizeLimit      = 0;
