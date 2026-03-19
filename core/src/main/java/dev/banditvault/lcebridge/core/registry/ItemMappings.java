@@ -5,6 +5,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import dev.banditvault.lcebridge.core.network.lce.LceItemStack;
+import org.geysermc.mcprotocollib.protocol.data.game.item.HashedStack;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -15,6 +16,7 @@ import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Maps Java 1.21.11 protocol item IDs to legacy LCE item IDs and metadata.
@@ -36,22 +38,37 @@ public class ItemMappings {
     private final String[] protocolIdToName;
     private final Map<String, Integer> blockDefaultStateIds;
     private final Map<String, Integer> legacyItemIds;
+    private final Map<Long, Integer> legacyExactToProtocolId;
+    private final Map<Integer, Integer> legacyIdToProtocolId;
 
     private ItemMappings(String[] protocolIdToName,
                          Map<String, Integer> blockDefaultStateIds,
-                         Map<String, Integer> legacyItemIds) {
+                         Map<String, Integer> legacyItemIds,
+                         Map<Long, Integer> legacyExactToProtocolId,
+                         Map<Integer, Integer> legacyIdToProtocolId) {
         this.protocolIdToName = protocolIdToName;
         this.blockDefaultStateIds = blockDefaultStateIds;
         this.legacyItemIds = legacyItemIds;
+        this.legacyExactToProtocolId = legacyExactToProtocolId;
+        this.legacyIdToProtocolId = legacyIdToProtocolId;
     }
 
     public static ItemMappings loadFromResource() {
         String[] protocolIdToName = loadItemProtocolNames();
         Map<String, Integer> blockDefaultStateIds = loadIntMap("/mappings/java_block_default_state_ids.json");
         Map<String, Integer> legacyItemIds = loadIntMap("/mappings/legacy_item_name_to_id.json");
+        Map<Long, Integer> legacyExactToProtocolId = new HashMap<>();
+        Map<Integer, Integer> legacyIdToProtocolId = new HashMap<>();
+        seedReverseLookups(protocolIdToName, blockDefaultStateIds, legacyItemIds, legacyExactToProtocolId, legacyIdToProtocolId);
         log.info("Loaded item lookup tables: protocolIds={}, blockDefaults={}, legacyIds={}",
             protocolIdToName.length, blockDefaultStateIds.size(), legacyItemIds.size());
-        return new ItemMappings(protocolIdToName, blockDefaultStateIds, legacyItemIds);
+        return new ItemMappings(
+            protocolIdToName,
+            blockDefaultStateIds,
+            legacyItemIds,
+            legacyExactToProtocolId,
+            legacyIdToProtocolId
+        );
     }
 
     public LceItemStack toLce(ItemStack item) {
@@ -64,6 +81,35 @@ public class ItemMappings {
             return null;
         }
         return new LceItemStack(mapped.id, item.getAmount(), mapped.data);
+    }
+
+    public Integer toJavaProtocolId(LceItemStack item) {
+        if (item == null || item.count <= 0) {
+            return null;
+        }
+
+        Integer exact = legacyExactToProtocolId.get(packLegacyKey(item.id, item.damage));
+        if (exact != null) {
+            return exact;
+        }
+        return legacyIdToProtocolId.get(item.id);
+    }
+
+    public HashedStack toJavaHashed(LceItemStack item) {
+        Integer protocolId = toJavaProtocolId(item);
+        if (protocolId == null) {
+            return null;
+        }
+        return new HashedStack(protocolId, item.count, Map.of(), Set.of());
+    }
+
+    public boolean isLikelyPlaceableBlock(LceItemStack item) {
+        Integer protocolId = toJavaProtocolId(item);
+        if (protocolId == null || protocolId < 0 || protocolId >= protocolIdToName.length) {
+            return false;
+        }
+        String javaName = protocolIdToName[protocolId];
+        return javaName != null && blockDefaultStateIds.containsKey(javaName);
     }
 
     private MappedItem mapProtocolId(int protocolItemId) {
@@ -108,6 +154,33 @@ public class ItemMappings {
         }
 
         return null;
+    }
+
+    private static void seedReverseLookups(String[] protocolIdToName,
+                                           Map<String, Integer> blockDefaultStateIds,
+                                           Map<String, Integer> legacyItemIds,
+                                           Map<Long, Integer> legacyExactToProtocolId,
+                                           Map<Integer, Integer> legacyIdToProtocolId) {
+        ItemMappings mappings = new ItemMappings(
+            protocolIdToName,
+            blockDefaultStateIds,
+            legacyItemIds,
+            Map.of(),
+            Map.of()
+        );
+
+        for (int protocolId = 0; protocolId < protocolIdToName.length; protocolId++) {
+            MappedItem mapped = mappings.mapProtocolId(protocolId);
+            if (mapped == null) {
+                continue;
+            }
+            legacyExactToProtocolId.putIfAbsent(packLegacyKey(mapped.id, mapped.data), protocolId);
+            legacyIdToProtocolId.putIfAbsent(mapped.id, protocolId);
+        }
+    }
+
+    private static long packLegacyKey(int id, int data) {
+        return ((long) id << 32) | (data & 0xFFFFFFFFL);
     }
 
     private static LegacyRef directOverride(String bareName) {

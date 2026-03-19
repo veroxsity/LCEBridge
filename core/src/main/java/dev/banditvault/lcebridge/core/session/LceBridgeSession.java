@@ -20,6 +20,7 @@ import org.geysermc.mcprotocollib.protocol.data.game.entity.player.Hand;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.InteractAction;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.PlayerSpawnInfo;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.type.EntityType;
+import org.geysermc.mcprotocollib.protocol.data.game.item.HashedStack;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ClickItemAction;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ContainerAction;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ContainerActionType;
@@ -159,6 +160,7 @@ public class LceBridgeSession {
     private volatile int currentCarriedSlot = 0;
     private volatile int lastSentCarriedSlot = -1;
     private volatile int blockActionSequence  = 0;
+    private volatile LceItemStack cachedCursorItem = null;
     private volatile org.cloudburstmc.math.vector.Vector3i activeDigPos = null;
     private volatile org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction activeDigFace = DEFAULT_DIG_FACE;
     private volatile byte lastJavaAbilityFlags = 0;
@@ -167,6 +169,8 @@ public class LceBridgeSession {
     private final Map<Integer, Integer> containerStateIds = new ConcurrentHashMap<>();
     private final Map<Long, CachedLceChunkColumn> translatedChunkCache = new ConcurrentHashMap<>();
     private final Map<Integer, TrackedEntity> trackedEntities = new ConcurrentHashMap<>();
+    private final Map<Integer, LceItemStack> pendingTrackedItemStacks = new ConcurrentHashMap<>();
+    private final Map<Integer, List<LceItemStack>> cachedContainerItems = new ConcurrentHashMap<>();
     private final Map<java.util.UUID, String> knownPlayerNames = new ConcurrentHashMap<>();
     private volatile int currentLevelIdx = 0;
     private volatile int nextRemotePlayerIndex = 5; // Local player is 4, remote players start at 5
@@ -425,6 +429,7 @@ public class LceBridgeSession {
         javaSession.send(new ServerboundUseItemOnPacket(
             pos, face, Hand.MAIN_HAND, p.clickX, p.clickY, p.clickZ, false, false, sequence
         ));
+        predictSelectedHotbarPlacement(p.item);
     }
 
     private void handleInteract(InteractPacket p) {
@@ -506,6 +511,9 @@ public class LceBridgeSession {
             activeDigFace = dir;
         }
         javaSession.send(new ServerboundPlayerActionPacket(action, pos, dir, seq));
+        if (p.action == 3 || p.action == 4) {
+            predictSelectedHotbarDrop(p.action == 3);
+        }
         if (p.action == 1 || p.action == 2) {
             clearActiveDigState();
         }
@@ -537,6 +545,7 @@ public class LceBridgeSession {
     private void handleContainerClose(ContainerClosePacket p) {
         if (!javaSession.isConnected()) return;
         containerStateIds.remove(p.containerId);
+        cachedContainerItems.remove(p.containerId);
         javaSession.send(new ServerboundContainerClosePacket(p.containerId));
     }
 
@@ -562,14 +571,15 @@ public class LceBridgeSession {
             return;
         }
 
+        PredictedContainerClick prediction = predictContainerClick(p);
         javaSession.send(new ServerboundContainerClickPacket(
             p.containerId,
             containerStateIds.getOrDefault(p.containerId, 0),
             p.slotNum,
             actionType,
             action,
-            null,
-            new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>()
+            MappingRegistry.items().toJavaHashed(prediction.carriedItem()),
+            prediction.changedSlots()
         ));
 
         ContainerAckPacket ack = new ContainerAckPacket();
@@ -909,11 +919,15 @@ public class LceBridgeSession {
     private void onJavaContainerSetContent(ClientboundContainerSetContentPacket p) {
         ContainerSetContentPacket content = new ContainerSetContentPacket();
         content.containerId = p.getContainerId();
+        List<LceItemStack> cachedItems = new java.util.ArrayList<>();
         if (p.getItems() != null) {
             for (var item : p.getItems()) {
-                content.items.add(MappingRegistry.items().toLce(item));
+                LceItemStack mapped = MappingRegistry.items().toLce(item);
+                content.items.add(mapped);
+                cachedItems.add(copyLceItem(mapped));
             }
         }
+        cachedContainerItems.put(p.getContainerId(), cachedItems);
         containerStateIds.put(p.getContainerId(), p.getStateId());
         sendLce(content);
         sendCursorItem(p.getCarriedItem());
@@ -924,6 +938,7 @@ public class LceBridgeSession {
         slot.containerId = p.getContainerId();
         slot.slot = p.getSlot();
         slot.item = MappingRegistry.items().toLce(p.getItem());
+        setCachedContainerSlot(p.getContainerId(), p.getSlot(), slot.item);
         containerStateIds.put(p.getContainerId(), p.getStateId());
         sendLce(slot);
     }
@@ -940,14 +955,21 @@ public class LceBridgeSession {
         ContainerClosePacket close = new ContainerClosePacket();
         close.containerId = p.getContainerId();
         containerStateIds.remove(p.getContainerId());
+        cachedContainerItems.remove(p.getContainerId());
         sendLce(close);
     }
 
     private void onJavaSetPlayerInventory(ClientboundSetPlayerInventoryPacket p) {
+        int translatedSlot = translateJavaPlayerInventorySlotToLce(p.getSlot());
+        if (translatedSlot < 0) {
+            log.debug("Ignoring unsupported Java player inventory slot {}", p.getSlot());
+            return;
+        }
         ContainerSetSlotPacket slot = new ContainerSetSlotPacket();
         slot.containerId = 0;
-        slot.slot = p.getSlot();
+        slot.slot = translatedSlot;
         slot.item = MappingRegistry.items().toLce(p.getContents());
+        setCachedContainerSlot(0, translatedSlot, slot.item);
         sendLce(slot);
     }
 
@@ -1095,6 +1117,8 @@ public class LceBridgeSession {
         // naturally follow with health + teleport updates.
         updateLevelIdx(p.getCommonPlayerSpawnInfo());
         containerStateIds.clear();
+        cachedContainerItems.clear();
+        cachedCursorItem = null;
         spawnFinished.set(false);
         postChunkReady.set(false);
         tileUpdatesReadyAtMs = Long.MAX_VALUE;
@@ -1113,6 +1137,7 @@ public class LceBridgeSession {
         clearActiveDigState();
         translatedChunkCache.clear();
         trackedEntities.clear();
+        pendingTrackedItemStacks.clear();
         nextRemotePlayerIndex = 5;
         sendLce(buildRespawnPacket());
         SetHealthPacket sh = new SetHealthPacket();
@@ -1129,6 +1154,9 @@ public class LceBridgeSession {
         if (tracked == null) {
             return;
         }
+        if (tracked.kind == TrackedEntityKind.ITEM) {
+            tracked.itemStack = pendingTrackedItemStacks.remove(tracked.entityId);
+        }
         trackedEntities.put(tracked.entityId, tracked);
         if (postChunkReady.get()) {
             spawnTrackedEntity(tracked);
@@ -1143,6 +1171,7 @@ public class LceBridgeSession {
         List<Integer> idsToRemove = new java.util.ArrayList<>();
         for (int entityId : p.getEntityIds()) {
             TrackedEntity tracked = trackedEntities.remove(entityId);
+            pendingTrackedItemStacks.remove(entityId);
             if (tracked != null && tracked.spawnedToLce) {
                 idsToRemove.add(entityId);
             }
@@ -1160,25 +1189,31 @@ public class LceBridgeSession {
     }
 
     private void onJavaSetEntityData(ClientboundSetEntityDataPacket p) {
-        TrackedEntity tracked = trackedEntities.get(p.getEntityId());
-        if (tracked == null || tracked.kind != TrackedEntityKind.ITEM || p.getMetadata() == null) {
+        org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack javaItemStack = extractJavaItemEntityStack(p);
+        if (javaItemStack == null) {
             return;
         }
 
-        boolean changed = false;
-        for (var metadata : p.getMetadata()) {
-            if (metadata == null || metadata.getType() != MetadataTypes.ITEM_STACK) {
-                continue;
-            }
-            Object value = metadata.getValue();
-            if (!(value instanceof org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack itemStack)) {
-                continue;
-            }
-            tracked.itemStack = MappingRegistry.items().toLce(itemStack);
-            changed = true;
+        LceItemStack mappedItem = MappingRegistry.items().toLce(javaItemStack);
+        if (mappedItem == null) {
+            log.debug("Unable to map Java item entity {} stack protocolId={} count={}",
+                p.getEntityId(), javaItemStack.getId(), javaItemStack.getAmount());
+            return;
         }
 
-        if (changed && tracked.spawnedToLce) {
+        TrackedEntity tracked = trackedEntities.get(p.getEntityId());
+        if (tracked == null) {
+            pendingTrackedItemStacks.put(p.getEntityId(), mappedItem);
+            return;
+        }
+        if (tracked.kind != TrackedEntityKind.ITEM) {
+            return;
+        }
+
+        tracked.itemStack = mappedItem;
+        if (!tracked.spawnedToLce && postChunkReady.get()) {
+            spawnTrackedEntity(tracked);
+        } else if (tracked.spawnedToLce) {
             sendTrackedItemMetadata(tracked);
         }
     }
@@ -1345,7 +1380,163 @@ public class LceBridgeSession {
         cursor.containerId = -1;
         cursor.slot = -1;
         cursor.item = MappingRegistry.items().toLce(item);
+        cachedCursorItem = copyLceItem(cursor.item);
         sendLce(cursor);
+    }
+
+    private PredictedContainerClick predictContainerClick(ContainerClickPacket p) {
+        it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<HashedStack> changedSlots =
+            new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>();
+
+        LceItemStack carriedBefore = copyLceItem(cachedCursorItem);
+        LceItemStack carriedAfter = copyLceItem(carriedBefore);
+        LceItemStack slotBefore = p.slotNum >= 0 ? getCachedContainerSlot(p.containerId, p.slotNum) : null;
+        if (slotBefore == null) {
+            slotBefore = copyLceItem(p.item);
+        }
+        LceItemStack slotAfter = copyLceItem(slotBefore);
+
+        if (p.slotNum == -999) {
+            if (carriedBefore != null) {
+                if (p.buttonNum == 0) {
+                    carriedAfter = null;
+                } else if (carriedBefore.count > 1) {
+                    carriedAfter = new LceItemStack(carriedBefore.id, carriedBefore.count - 1, carriedBefore.damage);
+                } else {
+                    carriedAfter = null;
+                }
+            }
+        } else if (p.clickType == 0) {
+            if (carriedBefore == null) {
+                if (slotBefore != null) {
+                    if (p.buttonNum == 0) {
+                        carriedAfter = copyLceItem(slotBefore);
+                        slotAfter = null;
+                    } else {
+                        int take = (slotBefore.count + 1) / 2;
+                        carriedAfter = new LceItemStack(slotBefore.id, take, slotBefore.damage);
+                        int remain = slotBefore.count - take;
+                        slotAfter = remain > 0 ? new LceItemStack(slotBefore.id, remain, slotBefore.damage) : null;
+                    }
+                }
+            } else if (slotBefore == null) {
+                int place = p.buttonNum == 0 ? carriedBefore.count : 1;
+                slotAfter = new LceItemStack(carriedBefore.id, place, carriedBefore.damage);
+                int remain = carriedBefore.count - place;
+                carriedAfter = remain > 0 ? new LceItemStack(carriedBefore.id, remain, carriedBefore.damage) : null;
+            } else if (canStackLceItems(slotBefore, carriedBefore)) {
+                int room = 64 - slotBefore.count;
+                int moved = Math.min(room, p.buttonNum == 0 ? carriedBefore.count : 1);
+                if (moved > 0) {
+                    slotAfter = new LceItemStack(slotBefore.id, slotBefore.count + moved, slotBefore.damage);
+                    int remain = carriedBefore.count - moved;
+                    carriedAfter = remain > 0 ? new LceItemStack(carriedBefore.id, remain, carriedBefore.damage) : null;
+                }
+            } else if (p.buttonNum == 0) {
+                slotAfter = copyLceItem(carriedBefore);
+                carriedAfter = copyLceItem(slotBefore);
+            }
+        } else if (p.clickType == 1) {
+            if (slotBefore != null) {
+                slotAfter = null;
+            }
+        }
+
+        if (p.slotNum >= 0 && !sameLceItem(slotBefore, slotAfter)) {
+            setCachedContainerSlot(p.containerId, p.slotNum, slotAfter);
+            changedSlots.put(p.slotNum, MappingRegistry.items().toJavaHashed(slotAfter));
+        }
+        cachedCursorItem = copyLceItem(carriedAfter);
+        return new PredictedContainerClick(carriedAfter, changedSlots);
+    }
+
+    private LceItemStack getCachedContainerSlot(int containerId, int slot) {
+        List<LceItemStack> items = cachedContainerItems.get(containerId);
+        if (items == null || slot < 0 || slot >= items.size()) {
+            return null;
+        }
+        return copyLceItem(items.get(slot));
+    }
+
+    private void setCachedContainerSlot(int containerId, int slot, LceItemStack item) {
+        if (slot < 0) {
+            return;
+        }
+        List<LceItemStack> items = cachedContainerItems.computeIfAbsent(containerId, ignored -> new java.util.ArrayList<>());
+        while (items.size() <= slot) {
+            items.add(null);
+        }
+        items.set(slot, copyLceItem(item));
+    }
+
+    private boolean canStackLceItems(LceItemStack a, LceItemStack b) {
+        return a != null && b != null && a.id == b.id && a.damage == b.damage && a.count < 64;
+    }
+
+    private boolean sameLceItem(LceItemStack a, LceItemStack b) {
+        if (a == b) {
+            return true;
+        }
+        if (a == null || b == null) {
+            return false;
+        }
+        return a.id == b.id && a.count == b.count && a.damage == b.damage;
+    }
+
+    private LceItemStack copyLceItem(LceItemStack item) {
+        return item == null ? null : new LceItemStack(item.id, item.count, item.damage);
+    }
+
+    private record PredictedContainerClick(
+        LceItemStack carriedItem,
+        it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<HashedStack> changedSlots
+    ) {
+    }
+
+    private void predictSelectedHotbarDrop(boolean fullStack) {
+        int slot = selectedHotbarInventorySlot();
+        LceItemStack existing = getCachedContainerSlot(0, slot);
+        if (existing == null) {
+            return;
+        }
+
+        LceItemStack updated;
+        if (fullStack || existing.count <= 1) {
+            updated = null;
+        } else {
+            updated = new LceItemStack(existing.id, existing.count - 1, existing.damage);
+        }
+        applyPredictedInventorySlot(0, slot, updated);
+    }
+
+    private void predictSelectedHotbarPlacement(LceItemStack usedItem) {
+        if (usedItem == null || !MappingRegistry.items().isLikelyPlaceableBlock(usedItem)) {
+            return;
+        }
+
+        int slot = selectedHotbarInventorySlot();
+        LceItemStack existing = getCachedContainerSlot(0, slot);
+        if (existing == null || existing.id != usedItem.id || existing.damage != usedItem.damage) {
+            return;
+        }
+
+        LceItemStack updated = existing.count <= 1
+            ? null
+            : new LceItemStack(existing.id, existing.count - 1, existing.damage);
+        applyPredictedInventorySlot(0, slot, updated);
+    }
+
+    private int selectedHotbarInventorySlot() {
+        return 36 + Math.max(0, Math.min(currentCarriedSlot, 8));
+    }
+
+    private void applyPredictedInventorySlot(int containerId, int slot, LceItemStack item) {
+        setCachedContainerSlot(containerId, slot, item);
+        ContainerSetSlotPacket update = new ContainerSetSlotPacket();
+        update.containerId = containerId;
+        update.slot = slot;
+        update.item = copyLceItem(item);
+        sendLce(update);
     }
 
     private void sendTileUpdate(int x, int y, int z, int javaBlockState) {
@@ -1593,6 +1784,9 @@ public class LceBridgeSession {
         if (tracked == null || !postChunkReady.get()) {
             return;
         }
+        if (tracked.kind == TrackedEntityKind.ITEM && tracked.itemStack == null) {
+            return;
+        }
         switch (tracked.kind) {
             case PLAYER -> {
                 AddPlayerPacket player = new AddPlayerPacket();
@@ -1717,6 +1911,41 @@ public class LceBridgeSession {
     private int velocityToLce(double velocity) {
         double clamped = Math.max(-3.9d, Math.min(3.9d, velocity));
         return (int) Math.round(clamped * 8000.0d);
+    }
+
+    private org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack extractJavaItemEntityStack(ClientboundSetEntityDataPacket p) {
+        if (p == null || p.getMetadata() == null) {
+            return null;
+        }
+        for (var metadata : p.getMetadata()) {
+            if (metadata == null) {
+                continue;
+            }
+            Object value = metadata.getValue();
+            if (value instanceof org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack itemStack) {
+                return itemStack;
+            }
+            if (metadata.getType() == MetadataTypes.ITEM_STACK && value == null) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private int translateJavaPlayerInventorySlotToLce(int javaSlot) {
+        if (javaSlot >= 0 && javaSlot <= 8) {
+            return 36 + javaSlot;
+        }
+        if (javaSlot >= 9 && javaSlot <= 35) {
+            return javaSlot;
+        }
+        return switch (javaSlot) {
+            case 36 -> 8; // boots
+            case 37 -> 7; // leggings
+            case 38 -> 6; // chestplate
+            case 39 -> 5; // helmet
+            default -> -1;
+        };
     }
 
     private Integer mapJavaMobType(EntityType type) {
@@ -1902,10 +2131,13 @@ public class LceBridgeSession {
         postChunkSpawnSent.set(false);
         teleportAcked.set(false);
         containerStateIds.clear();
+        cachedContainerItems.clear();
+        cachedCursorItem = null;
         blockActionSequence = 0;
         clearActiveDigState();
         translatedChunkCache.clear();
         trackedEntities.clear();
+        pendingTrackedItemStacks.clear();
         knownPlayerNames.clear();
         nextRemotePlayerIndex = 5;
         sendLce(makeDisconnect(2));
