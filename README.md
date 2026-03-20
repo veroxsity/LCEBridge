@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-0.2.0-2A9D8F?style=flat-square" alt="Version 0.2.0" />
+  <img src="https://img.shields.io/badge/Version-0.3.0-2A9D8F?style=flat-square" alt="Version 0.3.0" />
   <img src="https://img.shields.io/badge/Java-21-ED8B00?style=flat-square&logo=openjdk" alt="Java 21" />
   <img src="https://img.shields.io/badge/Build-Gradle-02303A?style=flat-square&logo=gradle" alt="Gradle" />
   <img src="https://img.shields.io/badge/Network-Netty-333333?style=flat-square" alt="Netty" />
@@ -27,10 +27,12 @@ The bridge translates between native LCE packets and modern Java Edition protoco
 
 - LCE login and session handling
 - Java login and in-world join flow
+- Launcher-provided online account handoff for Java online-mode servers
 - Chunk translation and chunk streaming
 - Block and item mapping
 - Multiplayer entity synchronization
 - Java-to-LCE chat and translated system message forwarding
+- Standalone runtime packaging for public releases
 
 ## Repository Layout
 
@@ -62,15 +64,29 @@ Build the standalone runtime jar:
 The runnable artifact is written to:
 
 ```text
-_build/bootstrap-standalone/libs/bootstrap-standalone-0.2.0.jar
+_build/bootstrap-standalone/libs/bootstrap-standalone-0.3.0.jar
+```
+
+Create the versioned release jar through the helper script:
+
+```powershell
+.\scripts\build-jar.ps1 --version v0.3.0
+```
+
+That writes the public release artifact into:
+
+```text
+scripts/output/bootstrap-standalone-0.3.0.jar
 ```
 
 ## Status
 
-LCEBridge is usable for active multiplayer testing, but it is still under development. Protocol coverage, gameplay parity, and edge-case compatibility are ongoing work.
+LCEBridge is usable for active multiplayer testing and public standalone releases, but it is still under development. Protocol coverage, gameplay parity, and edge-case compatibility across larger Java servers are ongoing work.
 
 ## Related Repositories
 
 - Hub repo: https://github.com/veroxsity/MinecraftLCE
 - Client repo: https://github.com/veroxsity/LCEClient
+- Debug client repo: https://github.com/veroxsity/LCEDebug
+- Launcher repo: https://github.com/veroxsity/LCELauncher
 - Server repo: https://github.com/veroxsity/LCEServer
