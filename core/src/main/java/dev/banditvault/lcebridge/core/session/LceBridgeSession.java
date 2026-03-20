@@ -1752,11 +1752,7 @@ public class LceBridgeSession {
         } else if (c instanceof net.kyori.adventure.text.KeybindComponent kc) {
             sb.append(kc.keybind());
         } else if (c instanceof net.kyori.adventure.text.ScoreComponent sc) {
-            if (sc.value() != null && !sc.value().isBlank()) {
-                sb.append(sc.value());
-            } else {
-                sb.append(sc.name());
-            }
+            sb.append(sc.name());
         } else if (c instanceof net.kyori.adventure.text.SelectorComponent sc) {
             sb.append(sc.pattern());
         } else if (c instanceof net.kyori.adventure.text.NBTComponent<?, ?> nc) {
@@ -1797,11 +1793,7 @@ public class LceBridgeSession {
         } else if (c instanceof net.kyori.adventure.text.KeybindComponent kc) {
             sb.append(kc.keybind());
         } else if (c instanceof net.kyori.adventure.text.ScoreComponent sc) {
-            if (sc.value() != null && !sc.value().isBlank()) {
-                sb.append(sc.value());
-            } else {
-                sb.append(sc.name());
-            }
+            sb.append(sc.name());
         } else if (c instanceof net.kyori.adventure.text.SelectorComponent sc) {
             sb.append(sc.pattern());
         } else if (c instanceof net.kyori.adventure.text.NBTComponent<?, ?> nc) {
