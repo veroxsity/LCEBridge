@@ -49,6 +49,11 @@ public class LceChannelHandler extends SimpleChannelInboundHandler<LcePacket> {
     @Override
     public void channelInactive(ChannelHandlerContext ctx) {
         log.info("LCE client disconnected: {}", ctx.channel().remoteAddress());
+        LceBridgeSession session = ctx.channel().attr(LceBridgeServer.SESSION_KEY).get();
+        if (session != null) {
+            session.handleLceTransportClosed("LCE channel closed");
+            ctx.channel().attr(LceBridgeServer.SESSION_KEY).set(null);
+        }
     }
 
     @Override

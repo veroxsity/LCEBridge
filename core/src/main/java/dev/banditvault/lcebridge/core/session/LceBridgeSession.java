@@ -138,6 +138,7 @@ public class LceBridgeSession {
     private final AtomicBoolean postChunkReady = new AtomicBoolean(false);
     private final AtomicBoolean warnedMovementBeforePostChunkReady = new AtomicBoolean(false);
     private final AtomicBoolean clientInformationSent = new AtomicBoolean(false);
+    private final AtomicBoolean playerLoadedSent = new AtomicBoolean(false);
     private final AtomicBoolean javaChunkBatchFinished = new AtomicBoolean(false);
     private final AtomicBoolean firstChunkLogged = new AtomicBoolean(false);
     private final AtomicBoolean teleportAcked  = new AtomicBoolean(false);
@@ -154,6 +155,7 @@ public class LceBridgeSession {
     private volatile long chunkLoadStartMs = 0L;
     private volatile long lastChunkNudgeMs = 0L;
     private volatile long lastDelimiterMs = 0L;
+    private volatile long lastClientTickEndSentMs = 0L;
     private volatile long lastMovePacketMs = 0L;
     private volatile long tileUpdatesReadyAtMs = Long.MAX_VALUE;
     private volatile long suppressPositionUntilMs = 0L;
@@ -343,6 +345,7 @@ public class LceBridgeSession {
                     p.pitch
                 );
             }
+            return;
         }
         lastMovePacketMs = now;
         boolean readyForPosition = postChunkReady.get();
@@ -352,14 +355,18 @@ public class LceBridgeSession {
             );
         }
         boolean movedEnough = false;
+        double translatedY = p.y;
+        if (hasPosition && !correctionEcho) {
+            translatedY = translateLceYToJava(p);
+        }
         // Keep last-known pose current for heartbeat and relative teleports, even when
         // LCE sends position-only or rotation-only variants.
         if (hasPosition) {
             movedEnough = Math.abs(p.x - lastKnownX) > 0.01d
-                || Math.abs(p.y - lastKnownY) > 0.01d
+                || Math.abs(translatedY - lastKnownY) > 0.01d
                 || Math.abs(p.z - lastKnownZ) > 0.01d;
             lastKnownX = p.x;
-            lastKnownY = p.y;
+            lastKnownY = translatedY;
             lastKnownZ = p.z;
         }
         if (p.id == 12 || p.id == 13) {
@@ -395,9 +402,9 @@ public class LceBridgeSession {
         }
         switch (p.id) {
             case 10 -> javaSession.send(new ServerboundMovePlayerStatusOnlyPacket(og, false));
-            case 11 -> javaSession.send(new ServerboundMovePlayerPosPacket(og, false, p.x, p.y, p.z));
+            case 11 -> javaSession.send(new ServerboundMovePlayerPosPacket(og, false, p.x, translatedY, p.z));
             case 12 -> javaSession.send(new ServerboundMovePlayerRotPacket(og, false, p.yaw, p.pitch));
-            case 13 -> javaSession.send(new ServerboundMovePlayerPosRotPacket(og, false, p.x, p.y, p.z, p.yaw, p.pitch));
+            case 13 -> javaSession.send(new ServerboundMovePlayerPosRotPacket(og, false, p.x, translatedY, p.z, p.yaw, p.pitch));
         }
     }
 
@@ -626,6 +633,12 @@ public class LceBridgeSession {
         javaSession.disconnect("Client disconnected");
     }
 
+    public void handleLceTransportClosed(String reason) {
+        log.info("LCE transport closed for '{}': {}", playerName, reason);
+        stopClientTickLoop();
+        javaSession.disconnect(reason);
+    }
+
     // ---- Java → Bridge -------------------------------------------------------
     private void handleJavaPacket(Packet pkt) {
         if (config.logPackets) {
@@ -744,7 +757,7 @@ public class LceBridgeSession {
         // sending these or the server gets duplicate tick-ends and disconnects us.
         delimiterSeen.set(true);
         lastDelimiterMs = System.currentTimeMillis();
-        javaSession.send(ServerboundClientTickEndPacket.INSTANCE);
+        sendClientTickEndIfDue();
     }
 
     private void onJavaSetHealth(ClientboundSetHealthPacket p) {
@@ -818,9 +831,7 @@ public class LceBridgeSession {
                 // If the teleport hasn't arrived yet, onJavaPlayerPosition will send
                 // PlayerLoaded once the ack goes out (see teleportAcked flag).
                 if (teleportAcked.get()) {
-                    javaSession.send(ServerboundPlayerLoadedPacket.INSTANCE);
-                    javaSession.send(new ServerboundChunkBatchReceivedPacket(advertisedChunkRate()));
-                    log.info("Sent PlayerLoaded + ChunkBatchReceived on LEVEL_CHUNKS_LOAD_START (teleport already acked)");
+                    sendPlayerLoadedOnce("Sent PlayerLoaded on LEVEL_CHUNKS_LOAD_START (teleport already acked)");
                 } else {
                     log.info("LEVEL_CHUNKS_LOAD_START received before teleport ack — deferring PlayerLoaded until ack");
                 }
@@ -1028,8 +1039,8 @@ public class LceBridgeSession {
     }
 
     private void onJavaChunkBatchFinished(ClientboundChunkBatchFinishedPacket p) {
-        javaSession.send(new ServerboundChunkBatchReceivedPacket(advertisedChunkRate()));
         javaChunkBatchFinished.set(true);
+        javaSession.send(new ServerboundChunkBatchReceivedPacket(advertisedChunkRate()));
         log.info("Java chunk batch finished: queued={}, pending={}", queuedChunkCount, pendingChunks.size());
 
         if (postChunkReady.get()) {
@@ -1134,9 +1145,7 @@ public class LceBridgeSession {
 
             // If LEVEL_CHUNKS_LOAD_START already fired, send PlayerLoaded now.
             if (chunkLoadStartMs > 0L) {
-                javaSession.send(ServerboundPlayerLoadedPacket.INSTANCE);
-                javaSession.send(new ServerboundChunkBatchReceivedPacket(advertisedChunkRate()));
-                log.info("Deferred PlayerLoaded + ChunkBatchReceived sent after teleport ack");
+                sendPlayerLoadedOnce("Deferred PlayerLoaded sent after teleport ack");
             }
         } else if (significantPositionCorrection) {
             if (significantHorizontalCorrection) {
@@ -1167,6 +1176,8 @@ public class LceBridgeSession {
         cachedCursorItem = null;
         spawnFinished.set(false);
         postChunkReady.set(false);
+        playerLoadedSent.set(false);
+        javaChunkBatchFinished.set(false);
         tileUpdatesReadyAtMs = Long.MAX_VALUE;
         initialTeleportHandled.set(false);
         postChunkSpawnSent.set(false);
@@ -1174,6 +1185,8 @@ public class LceBridgeSession {
         teleportAcked.set(false);
         playerMoving.set(false);
         lastMovePacketMs = 0L;
+        chunkLoadStartMs = 0L;
+        lastChunkNudgeMs = 0L;
         suppressPositionUntilMs = 0L;
         expectedCorrectionEchoUntilMs = 0L;
         awaitingCorrectionEcho = false;
@@ -2374,9 +2387,58 @@ public class LceBridgeSession {
         return true;
     }
 
+    private double translateLceYToJava(MovePlayerPacket p) {
+        double rawY = p.y;
+
+        // Most LCE movement packets already report the player's feet position in
+        // Java coordinates. Blindly preferring rawY + 1 based on lastKnownY causes
+        // the bridge to "learn" its own translated position and drift upward by a
+        // full block over time. Keep the startup correction narrow: only apply a
+        // +1 translation before post-chunk readiness, and only when the raw value
+        // is almost exactly one block below the last server-confirmed Y.
+        if (postChunkReady.get()) {
+            return rawY;
+        }
+
+        boolean looksLikeStandardEyeOffset = Math.abs((p.yView - p.y) - 1.62d) <= 0.2d;
+        if (!looksLikeStandardEyeOffset) {
+            return rawY;
+        }
+
+        double shiftedY = rawY + 1.0d;
+        double rawDistance = Math.abs(rawY - lastKnownY);
+        double shiftedDistance = Math.abs(shiftedY - lastKnownY);
+        boolean exactlyOneBlockBelowServerY = rawDistance >= 0.85d && rawDistance <= 1.15d;
+        boolean shiftedMatchesServerY = shiftedDistance <= 0.15d;
+        if (exactlyOneBlockBelowServerY && shiftedMatchesServerY) {
+            if (config.logPackets) {
+                log.debug(
+                    "Translated startup LCE Y from {} to {} for Java movement (lastKnownY={}, yView={})",
+                    rawY,
+                    shiftedY,
+                    lastKnownY,
+                    p.yView
+                );
+            }
+            return shiftedY;
+        }
+        return rawY;
+    }
+
     private float angularDistanceDegrees(float a, float b) {
         float delta = Math.abs(a - b) % 360.0f;
         return delta > 180.0f ? 360.0f - delta : delta;
+    }
+
+    private void sendPlayerLoadedOnce(String reason) {
+        if (!playerLoadedSent.compareAndSet(false, true)) {
+            if (config.logPackets) {
+                log.debug("Suppressing duplicate PlayerLoaded send: {}", reason);
+            }
+            return;
+        }
+        javaSession.send(ServerboundPlayerLoadedPacket.INSTANCE);
+        log.info(reason);
     }
 
     private void onJavaDisconnected() {
@@ -2396,6 +2458,10 @@ public class LceBridgeSession {
         postChunkSpawnSent.set(false);
         warnedMovementBeforePostChunkReady.set(false);
         teleportAcked.set(false);
+        playerLoadedSent.set(false);
+        javaChunkBatchFinished.set(false);
+        chunkLoadStartMs = 0L;
+        lastChunkNudgeMs = 0L;
         containerStateIds.clear();
         cachedContainerItems.clear();
         cachedCursorItem = null;
@@ -2480,6 +2546,9 @@ public class LceBridgeSession {
 
     private void startClientTickLoop() {
         stopClientTickLoop();
+        delimiterSeen.set(false);
+        lastDelimiterMs = 0L;
+        lastClientTickEndSentMs = 0L;
         tickEndScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "LceBridgeSession-TickEnd");
             t.setDaemon(true);
@@ -2492,7 +2561,7 @@ public class LceBridgeSession {
                 if (!javaSession.isConnected()) return;
                 long now = System.currentTimeMillis();
                 if (!delimiterSeen.get() || (now - lastDelimiterMs) > 250L) {
-                    javaSession.send(ServerboundClientTickEndPacket.INSTANCE);
+                    sendClientTickEndIfDue();
                 }
             } catch (Exception e) {
                 log.error("Tick-end loop error", e);
@@ -2508,10 +2577,23 @@ public class LceBridgeSession {
             tickEndScheduler.shutdownNow();
             tickEndScheduler = null;
         }
+        delimiterSeen.set(false);
+        lastDelimiterMs = 0L;
+        lastClientTickEndSentMs = 0L;
+    }
+
+    private void sendClientTickEndIfDue() {
+        long now = System.currentTimeMillis();
+        if ((now - lastClientTickEndSentMs) < 40L) {
+            return;
+        }
+        lastClientTickEndSentMs = now;
+        javaSession.send(ServerboundClientTickEndPacket.INSTANCE);
     }
 
     private void startChunkSendLoop() {
         stopChunkSendLoop();
+        playerLoadedSent.set(false);
         javaChunkBatchFinished.set(false);
         firstChunkLogged.set(false);
         queuedChunkCount = 0;
@@ -2528,12 +2610,11 @@ public class LceBridgeSession {
 
                 // If the server announced chunk load but nothing arrives, nudge it again.
                 long started = chunkLoadStartMs;
-                if (!postChunkReady.get() && started > 0L && queuedChunkCount == 0) {
+                if (!postChunkReady.get() && !playerLoadedSent.get() && started > 0L && queuedChunkCount == 0) {
                     long now = System.currentTimeMillis();
                     if (now - started >= 1500L && now - lastChunkNudgeMs >= 1000L) {
-                        javaSession.send(ServerboundPlayerLoadedPacket.INSTANCE);
+                        sendPlayerLoadedOnce("No chunks received yet; sent PlayerLoaded nudge");
                         lastChunkNudgeMs = now;
-                        log.warn("No chunks received yet; re-sent PlayerLoaded nudge (ChunkBatchReceived withheld — only valid after batch finish)");
                     }
                 }
             } catch (Exception e) {
@@ -2717,6 +2798,7 @@ public class LceBridgeSession {
     private boolean canSendTileUpdates() {
         return config.liveTileUpdates
             && postChunkReady.get()
+            && javaChunkBatchFinished.get()
             && System.currentTimeMillis() >= tileUpdatesReadyAtMs;
     }
 
