@@ -140,6 +140,8 @@ public class LceBridgeSession {
     private final AtomicBoolean clientInformationSent = new AtomicBoolean(false);
     private final AtomicBoolean playerLoadedSent = new AtomicBoolean(false);
     private final AtomicBoolean javaChunkBatchFinished = new AtomicBoolean(false);
+    private final AtomicBoolean trackedEntitiesFallbackEnabled = new AtomicBoolean(false);
+    private final AtomicBoolean trackedEntitiesFallbackScheduled = new AtomicBoolean(false);
     private final AtomicBoolean firstChunkLogged = new AtomicBoolean(false);
     private final AtomicBoolean teleportAcked  = new AtomicBoolean(false);
     private ScheduledExecutorService tickEndScheduler;
@@ -157,6 +159,7 @@ public class LceBridgeSession {
     private volatile long lastDelimiterMs = 0L;
     private volatile long lastClientTickEndSentMs = 0L;
     private volatile long lastMovePacketMs = 0L;
+    private volatile long lastAcceptedTeleportMs = 0L;
     private volatile long tileUpdatesReadyAtMs = Long.MAX_VALUE;
     private volatile long suppressPositionUntilMs = 0L;
     private volatile long expectedCorrectionEchoUntilMs = 0L;
@@ -1096,6 +1099,7 @@ public class LceBridgeSession {
         lastKnownZ     = newZ;
         lastKnownYaw   = newYaw;
         lastKnownPitch = newPitch;
+        lastAcceptedTeleportMs = System.currentTimeMillis();
         double deltaX = newX - previousX;
         double deltaY = newY - previousY;
         double deltaZ = newZ - previousZ;
@@ -1178,6 +1182,8 @@ public class LceBridgeSession {
         postChunkReady.set(false);
         playerLoadedSent.set(false);
         javaChunkBatchFinished.set(false);
+        trackedEntitiesFallbackEnabled.set(false);
+        trackedEntitiesFallbackScheduled.set(false);
         tileUpdatesReadyAtMs = Long.MAX_VALUE;
         initialTeleportHandled.set(false);
         postChunkSpawnSent.set(false);
@@ -1189,6 +1195,7 @@ public class LceBridgeSession {
         lastChunkNudgeMs = 0L;
         suppressPositionUntilMs = 0L;
         expectedCorrectionEchoUntilMs = 0L;
+        lastAcceptedTeleportMs = 0L;
         awaitingCorrectionEcho = false;
         currentCarriedSlot = 0;
         lastSentCarriedSlot = -1;
@@ -2451,6 +2458,7 @@ public class LceBridgeSession {
         suppressPositionUntilMs = 0L;
         expectedCorrectionEchoUntilMs = 0L;
         awaitingCorrectionEcho = false;
+        lastAcceptedTeleportMs = 0L;
         currentCarriedSlot = 0;
         lastSentCarriedSlot = -1;
         lastOnGround = true;
@@ -2460,6 +2468,8 @@ public class LceBridgeSession {
         teleportAcked.set(false);
         playerLoadedSent.set(false);
         javaChunkBatchFinished.set(false);
+        trackedEntitiesFallbackEnabled.set(false);
+        trackedEntitiesFallbackScheduled.set(false);
         chunkLoadStartMs = 0L;
         lastChunkNudgeMs = 0L;
         containerStateIds.clear();
@@ -2595,6 +2605,8 @@ public class LceBridgeSession {
         stopChunkSendLoop();
         playerLoadedSent.set(false);
         javaChunkBatchFinished.set(false);
+        trackedEntitiesFallbackEnabled.set(false);
+        trackedEntitiesFallbackScheduled.set(false);
         firstChunkLogged.set(false);
         queuedChunkCount = 0;
 
@@ -2787,12 +2799,13 @@ public class LceBridgeSession {
             sendPendingTrackedEntities();
         } else {
             log.warn("Deferring tracked entity spawn until Java chunk batch finish is observed");
+            scheduleTrackedEntityFallback();
         }
         log.info("Post-chunk spawn complete for '{}'", playerName);
     }
 
     private boolean canSpawnTrackedEntities() {
-        return postChunkReady.get() && javaChunkBatchFinished.get();
+        return postChunkReady.get() && (javaChunkBatchFinished.get() || trackedEntitiesFallbackEnabled.get());
     }
 
     private boolean canSendTileUpdates() {
@@ -2800,6 +2813,44 @@ public class LceBridgeSession {
             && postChunkReady.get()
             && javaChunkBatchFinished.get()
             && System.currentTimeMillis() >= tileUpdatesReadyAtMs;
+    }
+
+    private void scheduleTrackedEntityFallback() {
+        if (chunkSendScheduler == null || chunkSendScheduler.isShutdown()) {
+            return;
+        }
+        if (!trackedEntitiesFallbackScheduled.compareAndSet(false, true)) {
+            return;
+        }
+        chunkSendScheduler.schedule(this::enableTrackedEntityFallbackIfStable, 10, TimeUnit.SECONDS);
+    }
+
+    private void enableTrackedEntityFallbackIfStable() {
+        trackedEntitiesFallbackScheduled.set(false);
+        if (!lceChannel.isActive() || !javaSession.isConnected()) {
+            return;
+        }
+        if (!postChunkReady.get() || javaChunkBatchFinished.get() || trackedEntitiesFallbackEnabled.get()) {
+            return;
+        }
+
+        long sinceTeleportMs = lastAcceptedTeleportMs == 0L
+            ? Long.MAX_VALUE
+            : System.currentTimeMillis() - lastAcceptedTeleportMs;
+        if (sinceTeleportMs < 5000L) {
+            long delayMs = Math.max(1000L, 5000L - sinceTeleportMs);
+            if (chunkSendScheduler != null
+                && !chunkSendScheduler.isShutdown()
+                && trackedEntitiesFallbackScheduled.compareAndSet(false, true)) {
+                log.info("Delaying tracked entity fallback; latest teleport was {} ms ago", sinceTeleportMs);
+                chunkSendScheduler.schedule(this::enableTrackedEntityFallbackIfStable, delayMs, TimeUnit.MILLISECONDS);
+            }
+            return;
+        }
+
+        trackedEntitiesFallbackEnabled.set(true);
+        log.warn("Enabling tracked entity spawn fallback without Java chunk batch finish");
+        sendPendingTrackedEntities();
     }
 
     private void rememberRecentDigLog(org.cloudburstmc.math.vector.Vector3i pos) {
