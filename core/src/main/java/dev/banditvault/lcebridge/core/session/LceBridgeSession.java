@@ -79,6 +79,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class LceBridgeSession {
     private static final Logger log = LoggerFactory.getLogger(LceBridgeSession.class);
@@ -96,6 +97,8 @@ public class LceBridgeSession {
     private static final double FORWARDED_CORRECTION_HORIZONTAL_DELTA = 0.75d;
     private static final double FORWARDED_CORRECTION_VERTICAL_DELTA = 1.25d;
     private static final int LCE_ITEM_ENTITY_DATA_SLOT = 10;
+    private static final int MAX_REMOTE_PLAYER_ENTITIES = 64;
+    private static final int MAX_CACHED_PLAYER_NAMES = 512;
     private static final org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction DEFAULT_DIG_FACE =
         org.geysermc.mcprotocollib.protocol.data.game.entity.object.Direction.DOWN;
 
@@ -198,8 +201,9 @@ public class LceBridgeSession {
     private final Map<Integer, LceItemStack> pendingTrackedItemStacks = new ConcurrentHashMap<>();
     private final Map<Integer, List<LceItemStack>> cachedContainerItems = new ConcurrentHashMap<>();
     private final Map<java.util.UUID, String> knownPlayerNames = new ConcurrentHashMap<>();
+    private final Queue<Integer> freeRemotePlayerIndices = new ConcurrentLinkedQueue<>();
+    private final AtomicInteger activeRemotePlayerCount = new AtomicInteger(0);
     private volatile int currentLevelIdx = 0;
-    private volatile int nextRemotePlayerIndex = 5; // Local player is 4, remote players start at 5
     private volatile int javaEntityId = -1; // The player's entity ID on the Java server
 
     private String playerName = "Unknown";
@@ -212,6 +216,7 @@ public class LceBridgeSession {
         this.javaSession = new JavaSession(config, "player");
         this.javaSession.setPacketHandler(this::handleJavaPacket);
         this.javaSession.setDisconnectHandler(this::onJavaDisconnected);
+        resetRemotePlayerIndices();
     }
 
     // ---- server speaks first ------------------------------------------------
@@ -1267,7 +1272,7 @@ public class LceBridgeSession {
         translatedChunkCache.clear();
         trackedEntities.clear();
         pendingTrackedItemStacks.clear();
-        nextRemotePlayerIndex = 5;
+        resetRemotePlayerIndices();
         sendLce(buildRespawnPacket());
         SetHealthPacket sh = new SetHealthPacket();
         sh.health = 20.0f;
@@ -1286,7 +1291,8 @@ public class LceBridgeSession {
         if (tracked.kind == TrackedEntityKind.ITEM) {
             tracked.itemStack = pendingTrackedItemStacks.remove(tracked.entityId);
         }
-        trackedEntities.put(tracked.entityId, tracked);
+        TrackedEntity previous = trackedEntities.put(tracked.entityId, tracked);
+        releaseTrackedEntityResources(previous);
         if (canSpawnTrackedEntities()) {
             spawnTrackedEntity(tracked);
         }
@@ -1301,6 +1307,7 @@ public class LceBridgeSession {
         for (int entityId : p.getEntityIds()) {
             TrackedEntity tracked = trackedEntities.remove(entityId);
             pendingTrackedItemStacks.remove(entityId);
+            releaseTrackedEntityResources(tracked);
             if (tracked != null && tracked.spawnedToLce) {
                 idsToRemove.add(entityId);
             }
@@ -1562,12 +1569,18 @@ public class LceBridgeSession {
 
     private void onJavaPlayerInfoUpdate(ClientboundPlayerInfoUpdatePacket p) {
         if (p.getEntries() == null) return;
+        if (!postChunkReady.get()) {
+            return;
+        }
         for (PlayerListEntry entry : p.getEntries()) {
             if (entry == null || entry.getProfileId() == null) continue;
             // Cache player name from the GameProfile
             if (entry.getProfile() != null && entry.getProfile().getName() != null
                     && !entry.getProfile().getName().isBlank()) {
                 String name = entry.getProfile().getName();
+                if (!knownPlayerNames.containsKey(entry.getProfileId()) && knownPlayerNames.size() >= MAX_CACHED_PLAYER_NAMES) {
+                    continue;
+                }
                 knownPlayerNames.put(entry.getProfileId(), name);
                 // If we already have a tracked entity for this UUID, update its name
                 for (TrackedEntity tracked : trackedEntities.values()) {
@@ -1581,6 +1594,9 @@ public class LceBridgeSession {
     }
 
     private void onJavaPlayerInfoRemove(ClientboundPlayerInfoRemovePacket p) {
+        if (!postChunkReady.get()) {
+            return;
+        }
         if (p.getProfileIds() == null) {
             return;
         }
@@ -2087,12 +2103,22 @@ public class LceBridgeSession {
 
         TrackedEntity tracked;
         if (type == EntityType.PLAYER) {
+            if (activeRemotePlayerCount.get() >= MAX_REMOTE_PLAYER_ENTITIES) {
+                log.debug("Skipping remote player entity {} because the crowded-server cap ({}) was reached", entityId, MAX_REMOTE_PLAYER_ENTITIES);
+                return null;
+            }
+            Integer playerIndex = freeRemotePlayerIndices.poll();
+            if (playerIndex == null) {
+                log.debug("Skipping remote player entity {} because no player index slots are available", entityId);
+                return null;
+            }
             tracked = new TrackedEntity(entityId, TrackedEntityKind.PLAYER, 0);
             tracked.headYaw = p.getHeadYaw();
             tracked.playerUuid = p.getUuid();
             String cachedName = p.getUuid() != null ? knownPlayerNames.get(p.getUuid()) : null;
             tracked.playerName = cachedName != null ? cachedName : "Player";
-            tracked.playerIndex = nextRemotePlayerIndex++;
+            tracked.playerIndex = playerIndex;
+            activeRemotePlayerCount.incrementAndGet();
         } else {
             Integer mobType = mapJavaMobType(type);
         if (mobType != null) {
@@ -2256,6 +2282,29 @@ public class LceBridgeSession {
 
     private boolean isSupportedLceEntityId(int entityId) {
         return entityId >= 0 && entityId <= 0x7FFF;
+    }
+
+    private void resetRemotePlayerIndices() {
+        freeRemotePlayerIndices.clear();
+        for (int index = 5; index <= 255; index++) {
+            freeRemotePlayerIndices.offer(index);
+        }
+        activeRemotePlayerCount.set(0);
+    }
+
+    private void releaseTrackedEntityResources(TrackedEntity tracked) {
+        if (tracked == null) {
+            return;
+        }
+        if (tracked.kind == TrackedEntityKind.PLAYER) {
+            if (tracked.playerUuid != null && !tracked.spawnedToLce) {
+                knownPlayerNames.remove(tracked.playerUuid);
+            }
+            if (tracked.playerIndex >= 5 && tracked.playerIndex <= 255) {
+                freeRemotePlayerIndices.offer(tracked.playerIndex);
+            }
+            activeRemotePlayerCount.updateAndGet(count -> Math.max(0, count - 1));
+        }
     }
 
     private int toLceFixed(double value) {
@@ -2555,7 +2604,7 @@ public class LceBridgeSession {
         trackedEntities.clear();
         pendingTrackedItemStacks.clear();
         knownPlayerNames.clear();
-        nextRemotePlayerIndex = 5;
+        resetRemotePlayerIndices();
         sendLce(makeDisconnect(2));
         lceChannel.close();
     }
