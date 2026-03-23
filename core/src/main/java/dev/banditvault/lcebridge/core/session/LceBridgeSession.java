@@ -92,6 +92,8 @@ public class LceBridgeSession {
     private static final int LCE_ENTITY_ID        = (LCE_SMALL_ID * 100) + 1; // = 401
     private static final long TILE_UPDATE_GRACE_MS = 2000L;
     private static final long EARLY_POST_CHUNK_FALLBACK_MS = 1500L;
+    private static final long TRACKED_ENTITY_FALLBACK_DELAY_MS = 3000L;
+    private static final long TRACKED_ENTITY_FALLBACK_TELEPORT_SETTLE_MS = 2000L;
     private static final long TELEPORT_SETTLE_MS = 200L;
     private static final long ACTION_POSE_FLUSH_STALE_MS = 125L;
     private static final double FORWARDED_CORRECTION_HORIZONTAL_DELTA = 0.75d;
@@ -317,6 +319,14 @@ public class LceBridgeSession {
         // Extract the message text from stringArgs[0] (e_ChatCustom format)
         String text = (!p.stringArgs.isEmpty()) ? p.stringArgs.get(0) : "";
         if (text.isEmpty()) return;
+        if (text.startsWith("/")) {
+            String command = text.substring(1).trim();
+            if (!command.isEmpty()) {
+                javaSession.send(new ServerboundChatCommandPacket(command));
+                log.info("Forwarded LCE slash command to Java: /{}", command);
+            }
+            return;
+        }
         javaSession.send(new ServerboundChatPacket(text, System.currentTimeMillis(), 0L, null, 0, new BitSet(), 0));
     }
 
@@ -1569,9 +1579,6 @@ public class LceBridgeSession {
 
     private void onJavaPlayerInfoUpdate(ClientboundPlayerInfoUpdatePacket p) {
         if (p.getEntries() == null) return;
-        if (!postChunkReady.get()) {
-            return;
-        }
         for (PlayerListEntry entry : p.getEntries()) {
             if (entry == null || entry.getProfileId() == null) continue;
             // Cache player name from the GameProfile
@@ -2978,7 +2985,7 @@ public class LceBridgeSession {
         if (!trackedEntitiesFallbackScheduled.compareAndSet(false, true)) {
             return;
         }
-        chunkSendScheduler.schedule(this::enableTrackedEntityFallbackIfStable, 10, TimeUnit.SECONDS);
+        chunkSendScheduler.schedule(this::enableTrackedEntityFallbackIfStable, TRACKED_ENTITY_FALLBACK_DELAY_MS, TimeUnit.MILLISECONDS);
     }
 
     private void enableTrackedEntityFallbackIfStable() {
@@ -2993,8 +3000,8 @@ public class LceBridgeSession {
         long sinceTeleportMs = lastAcceptedTeleportMs == 0L
             ? Long.MAX_VALUE
             : System.currentTimeMillis() - lastAcceptedTeleportMs;
-        if (sinceTeleportMs < 5000L) {
-            long delayMs = Math.max(1000L, 5000L - sinceTeleportMs);
+        if (sinceTeleportMs < TRACKED_ENTITY_FALLBACK_TELEPORT_SETTLE_MS) {
+            long delayMs = Math.max(1000L, TRACKED_ENTITY_FALLBACK_TELEPORT_SETTLE_MS - sinceTeleportMs);
             if (chunkSendScheduler != null
                 && !chunkSendScheduler.isShutdown()
                 && trackedEntitiesFallbackScheduled.compareAndSet(false, true)) {
